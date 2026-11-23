@@ -1,0 +1,29 @@
+# Model weights and binaries
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.imatrix
+brain/*.gguf
+
+# Large datasets, checkpoints, and scratch outputs
+data/
+datasets/
+checkpoints/
+outputs/
+work/
+
+# Python, Jupyter, and environment files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.env
+.env.*
+
+# OS metadata
+.DS_Store
+Thumbs.db
