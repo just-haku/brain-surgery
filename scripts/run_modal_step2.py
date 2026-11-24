@@ -48,7 +48,10 @@ vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 hf_secret = modal.Secret.from_name(HF_SECRET_NAME)
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.4.1-devel-ubuntu22.04",
+        add_python="3.11",
+    )
     .apt_install("git", "cmake", "build-essential", "pkg-config")
     .pip_install(
         "torch>=2.5.0",
@@ -67,10 +70,17 @@ image = (
     )
     .run_commands(
         f"git clone --depth 1 https://github.com/ggml-org/llama.cpp {LLAMA_CPP_DIR}",
-        f"cmake -B {LLAMA_CPP_DIR}/build -S {LLAMA_CPP_DIR} -DGGML_CUDA=OFF -DLLAMA_CURL=OFF",
         (
+            "ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && "
+            "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH "
+            f"cmake -B {LLAMA_CPP_DIR}/build -S {LLAMA_CPP_DIR} "
+            '-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80" -DLLAMA_CURL=OFF '
+            '-DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" '
+            '-DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" && '
+            "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH "
             f"cmake --build {LLAMA_CPP_DIR}/build --config Release "
-            "--target llama-quantize llama-imatrix llama-cli -j8"
+            "--target llama-quantize llama-imatrix llama-cli -j8 && "
+            "rm -f /usr/local/cuda/lib64/stubs/libcuda.so.1"
         ),
     )
     .env(
@@ -106,7 +116,7 @@ def _resolve_hf_token() -> str | None:
     gpu="A100",
     cpu=8,
     memory=32768,
-    timeout=7200,
+    timeout=14400,
     volumes={VOLUME_MOUNT: vol},
     secrets=[hf_secret],
 )
@@ -219,6 +229,10 @@ def run_step2_pipeline(
         summary["orpo"] = run_orpo_training(orpo_cfg)
         final_merged_dir = orpo_merged_dir
         vol.commit()
+    elif (orpo_merged_dir / "config.json").exists():
+        final_merged_dir = orpo_merged_dir
+
+    print(f"[run_modal_step2] Final merged checkpoint: {final_merged_dir}", flush=True)
 
     if run_export:
         calib_txt = write_imatrix_calib_corpus(
@@ -231,8 +245,10 @@ def run_step2_pipeline(
             model_prefix=preset["model_prefix"],
             quants=("IQ4_XS", "Q4_K_M"),
             mmproj_outtypes=("bf16", "q8_0"),
+            mmproj_model_dir=base_dir,
             imatrix_calib_file=calib_txt,
             imatrix_chunks=128,
+            imatrix_ngl=99,
         )
 
         cli_bin = f"{LLAMA_CPP_DIR}/build/bin/llama-cli"

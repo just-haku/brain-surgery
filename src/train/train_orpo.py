@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import importlib.util
 import inspect
 import json
 from pathlib import Path
@@ -61,6 +62,47 @@ def freeze_embeddings_and_ple(
     return frozen
 
 
+def build_orpo_config_kwargs(
+    config_cls: Any,
+    cfg: ORPOConfig,
+    *,
+    out_dir: str | Path,
+    use_8bit_adam: bool = False,
+) -> dict[str, Any]:
+    """Build TRL ORPOConfig kwargs filtered cleanly across TRL v4/v5+ versions."""
+    params = inspect.signature(config_cls.__init__).parameters
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    kwargs: dict[str, Any] = {
+        "output_dir": str(out_dir),
+        "beta": cfg.beta,
+        "learning_rate": cfg.learning_rate,
+        "num_train_epochs": cfg.num_train_epochs,
+        "per_device_train_batch_size": cfg.per_device_train_batch_size,
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+        "lr_scheduler_type": "cosine",
+        "bf16": True,
+        "logging_steps": cfg.logging_steps,
+        "save_strategy": "epoch",
+        "report_to": "none",
+        "seed": cfg.seed,
+        **build_warmup_kwargs(config_cls, cfg.warmup_ratio),
+    }
+    optional_candidates: dict[str, Any] = {
+        "max_length": cfg.max_length,
+        "max_prompt_length": cfg.max_prompt_length,
+        "dataset_num_proc": 1,
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "optim": "adamw_bnb_8bit" if use_8bit_adam else "adamw_torch",
+    }
+    for key, val in optional_candidates.items():
+        if key in params or accepts_var_kw:
+            kwargs[key] = val
+    return kwargs
+
+
 def run_orpo_training(cfg: ORPOConfig) -> dict[str, Any]:
     """Execute 1-epoch ORPO alignment with Vision/Audio and embeddings/PLE frozen."""
     from datasets import Dataset
@@ -107,24 +149,14 @@ def run_orpo_training(cfg: ORPOConfig) -> dict[str, Any]:
     merged_dir = Path(cfg.merged_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    trl_args = TRLORPOConfig(
-        output_dir=str(out_dir),
-        beta=cfg.beta,
-        learning_rate=cfg.learning_rate,
-        num_train_epochs=cfg.num_train_epochs,
-        per_device_train_batch_size=cfg.per_device_train_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        max_length=cfg.max_length,
-        max_prompt_length=cfg.max_prompt_length,
-        lr_scheduler_type="cosine",
-        bf16=True,
-        logging_steps=cfg.logging_steps,
-        save_strategy="epoch",
-        dataset_num_proc=1,
-        report_to="none",
-        seed=cfg.seed,
-        **build_warmup_kwargs(TRLORPOConfig, cfg.warmup_ratio),
+    has_bnb = importlib.util.find_spec("bitsandbytes") is not None
+    trl_kwargs = build_orpo_config_kwargs(
+        TRLORPOConfig,
+        cfg,
+        out_dir=out_dir,
+        use_8bit_adam=(not cfg.use_4bit) and has_bnb,
     )
+    trl_args = TRLORPOConfig(**trl_kwargs)
 
     trainer_tok_kw = (
         {"processing_class": tok}

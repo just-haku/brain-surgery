@@ -72,13 +72,16 @@ def build_export_commands(
     quants: tuple[str, ...] | list[str] = DEFAULT_QUANTS,
     mmproj_outtypes: tuple[str, ...] | list[str] | None = DEFAULT_MMPROJ_OUTTYPES,
     mmproj_outtype: str | None = None,
+    mmproj_model_dir: str | Path | None = None,
     imatrix_calib_file: str | Path | None = None,
     imatrix_chunks: int = 128,
+    imatrix_ngl: int = 0,
     python_exe: str | None = None,
 ) -> dict[str, list[str]]:
     """Build exact argv lists for convert_hf_to_gguf.py, llama-imatrix, and llama-quantize."""
     py = python_exe or sys.executable
     model = Path(model_dir)
+    mmproj_src = Path(mmproj_model_dir) if mmproj_model_dir is not None else model
     out = Path(out_dir)
     llama = Path(llama_cpp_dir)
 
@@ -107,7 +110,7 @@ def build_export_commands(
         cmds[f"convert_mmproj_{mm_t}"] = [
             py,
             str(convert_py),
-            str(model),
+            str(mmproj_src),
             "--mmproj",
             "--outfile",
             str(mmproj_gguf),
@@ -117,7 +120,7 @@ def build_export_commands(
 
     use_imatrix = imatrix_calib_file is not None
     if use_imatrix:
-        cmds["imatrix"] = [
+        imatrix_cmd = [
             str(imatrix_bin),
             "-m",
             str(bf16_gguf),
@@ -128,6 +131,9 @@ def build_export_commands(
             "--chunks",
             str(imatrix_chunks),
         ]
+        if imatrix_ngl > 0:
+            imatrix_cmd.extend(["-ngl", str(imatrix_ngl)])
+        cmds["imatrix"] = imatrix_cmd
 
     for qtype in quants:
         q_upper = qtype.upper()
@@ -150,8 +156,10 @@ def export_modular_gguf(
     quants: tuple[str, ...] | list[str] = DEFAULT_QUANTS,
     mmproj_outtypes: tuple[str, ...] | list[str] | None = DEFAULT_MMPROJ_OUTTYPES,
     mmproj_outtype: str | None = None,
+    mmproj_model_dir: str | Path | None = None,
     imatrix_calib_file: str | Path | None = None,
     imatrix_chunks: int = 128,
+    imatrix_ngl: int = 0,
     keep_bf16: bool = False,
 ) -> dict[str, Any]:
     """Run BF16 GGUF conversion, bf16/q8_0 --mmproj export, optional imatrix, and quantization."""
@@ -165,8 +173,10 @@ def export_modular_gguf(
         model_prefix=model_prefix,
         quants=quants,
         mmproj_outtypes=eff_mm_types,
+        mmproj_model_dir=mmproj_model_dir,
         imatrix_calib_file=imatrix_calib_file,
         imatrix_chunks=imatrix_chunks,
+        imatrix_ngl=imatrix_ngl,
     )
 
     for step_name, cmd in cmds.items():
@@ -215,6 +225,7 @@ def export_modular_gguf(
 
     manifest = {
         "model_dir": str(model_dir),
+        "mmproj_model_dir": str(mmproj_model_dir or model_dir),
         "out_dir": str(out),
         "model_prefix": model_prefix,
         "imatrix_used": imatrix_calib_file is not None,
@@ -231,6 +242,7 @@ def export_modular_gguf(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Export modular text GGUF + bf16/q8_0 --mmproj GGUF")
     p.add_argument("--model-dir", required=True)
+    p.add_argument("--mmproj-model-dir", default=None)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--llama-cpp-dir", required=True)
     p.add_argument("--model-prefix", default="gemma4-e4b-nc")
@@ -239,6 +251,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mmproj-outtype", default=None)
     p.add_argument("--imatrix-calib-file", default=None)
     p.add_argument("--imatrix-chunks", type=int, default=128)
+    p.add_argument("--imatrix-ngl", type=int, default=0)
     p.add_argument("--keep-bf16", action="store_true")
     return p
 
@@ -253,8 +266,10 @@ def main(argv: list[str] | None = None) -> int:
         quants=tuple(ns.quants),
         mmproj_outtypes=tuple(ns.mmproj_outtypes),
         mmproj_outtype=ns.mmproj_outtype,
+        mmproj_model_dir=ns.mmproj_model_dir,
         imatrix_calib_file=ns.imatrix_calib_file,
         imatrix_chunks=ns.imatrix_chunks,
+        imatrix_ngl=ns.imatrix_ngl,
         keep_bf16=ns.keep_bf16,
     )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))

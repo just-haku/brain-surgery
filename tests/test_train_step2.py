@@ -30,7 +30,7 @@ from train.mm_integrity import (  # noqa: E402
     is_multimodal_tensor_name,
     verify_multimodal_integrity,
 )
-from train.train_orpo import freeze_embeddings_and_ple  # noqa: E402
+from train.train_orpo import ORPOConfig, build_orpo_config_kwargs, freeze_embeddings_and_ple  # noqa: E402
 from train.train_sft import (  # noqa: E402
     SFTConfig,
     build_param_groups,
@@ -311,14 +311,20 @@ class TestExportAndStep2Notebook(unittest.TestCase):
             llama_cpp_dir="/content/llama.cpp",
             quants=("IQ4_XS", "Q4_K_M"),
             mmproj_outtypes=("bf16", "q8_0"),
+            mmproj_model_dir="cache/base_ckpt",
             imatrix_calib_file="work/calib.txt",
+            imatrix_ngl=99,
             python_exe="python",
         )
         self.assertIn("--mmproj", cmds["convert_mmproj_bf16"])
         self.assertIn("bf16", cmds["convert_mmproj_bf16"])
         self.assertIn("--mmproj", cmds["convert_mmproj_q8_0"])
         self.assertIn("q8_0", cmds["convert_mmproj_q8_0"])
+        self.assertEqual(cmds["convert_text_bf16"][2], str(Path("outputs/final_bf16")))
+        self.assertEqual(cmds["convert_mmproj_bf16"][2], str(Path("cache/base_ckpt")))
+        self.assertEqual(cmds["convert_mmproj_q8_0"][2], str(Path("cache/base_ckpt")))
         self.assertIn("imatrix", cmds)
+        self.assertEqual(cmds["imatrix"][-2:], ["-ngl", "99"])
         self.assertIn("--imatrix", cmds["quantize_IQ4_XS"])
         self.assertIn("--imatrix", cmds["quantize_Q4_K_M"])
         self.assertEqual(cmds["quantize_IQ4_XS"][-1], "IQ4_XS")
@@ -353,13 +359,50 @@ class TestExportAndStep2Notebook(unittest.TestCase):
         self.assertEqual(build_warmup_kwargs(_V4Args, 0.05), {"warmup_ratio": 0.05})
         self.assertEqual(build_warmup_kwargs(_V5Args, 0.05), {"warmup_steps": 0.05})
 
+        class _OldTRLORPOConfig:
+            def __init__(
+                self,
+                output_dir: str,
+                beta: float = 0.1,
+                max_length: int = 1024,
+                max_prompt_length: int = 512,
+                dataset_num_proc: int = 1,
+                warmup_ratio: float = 0.0,
+                **_: object,
+            ) -> None:
+                pass
+
+        class _NewTRLORPOConfig:
+            def __init__(
+                self,
+                output_dir: str,
+                beta: float = 0.1,
+                max_length: int = 1024,
+                warmup_steps: float = 0.0,
+                optim: str = "adamw_torch",
+            ) -> None:
+                pass
+
+        orpo_cfg = ORPOConfig(use_4bit=False)
+        old_kw = build_orpo_config_kwargs(_OldTRLORPOConfig, orpo_cfg, out_dir="outputs/orpo", use_8bit_adam=True)
+        self.assertIn("max_prompt_length", old_kw)
+        self.assertIn("dataset_num_proc", old_kw)
+
+        new_kw = build_orpo_config_kwargs(_NewTRLORPOConfig, orpo_cfg, out_dir="outputs/orpo", use_8bit_adam=True)
+        self.assertNotIn("max_prompt_length", new_kw)
+        self.assertNotIn("dataset_num_proc", new_kw)
+        self.assertEqual(new_kw["beta"], 0.1)
+        self.assertEqual(new_kw["max_length"], 4096)
+        self.assertEqual(new_kw["warmup_steps"], 0.05)
+        self.assertEqual(new_kw["optim"], "adamw_bnb_8bit")
+
         modal_src = MODAL_SCRIPT.read_text(encoding="utf-8")
         tree = ast.parse(modal_src, filename=str(MODAL_SCRIPT))
         for tok in (
             "nuclear-distill-vol",
             "huggingface-secret",
             'gpu="A100"',
-            "timeout=7200",
+            "timeout=14400",
             "vol.commit()",
             "haku-nekooo/gemma4-e4b-nuclear-pruned",
             "haku-nekooo/gemma4-e4b-nuclear-agent",
