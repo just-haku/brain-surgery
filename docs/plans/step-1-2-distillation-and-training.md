@@ -16,34 +16,31 @@
 
 ---
 
-## 2. Chuẩn Wire Format Gemma 4 & Hợp đồng `nc-agent` (Đã xác minh từ Source Code)
+## 2. Chuẩn Wire Format Gemma 4 & Hợp đồng `NativeTools` của `nc-agent`
 
-### 2.1. Hợp đồng Thực tế của `nc-agent` (`D:\Coding\nuclear_code`)
+### 2.1. Hợp đồng Tool của `nc-agent` (`D:\Coding\nuclear_code`) & Kiến trúc `NativeTools`
 
-Qua đọc trực tiếp `crates/nc-agent/src/context.rs`, `orchestrator.rs`, `providers.rs` và `prompts/caveman_system.md`:
+Theo đề xuất nâng cấp đa provider trong `CHANGE-SUGGESTIONS.md` của `nuclear-code`, `nc-agent` chuyển từ ép cứng `grammar: tool_call_gbnf()` sang **`ToolCallingMode::NativeTools`** khi chạy với `llama-server --jinja` (chỉ giữ `StructuredJsonGrammar` làm fallback cho model cũ):
 
-- **Giao thức gọi `llama-server --jinja`**: `nc-agent` gửi `POST /v1/chat/completions` kèm `messages: [system, user]` và tham số `grammar` (`tool_call_gbnf()`, `planner_gbnf()`, hoặc `final_only_gbnf()`). `llama-server --jinja` áp dụng `chat_template.jinja`, tách phần `<|channel>thought\n...<channel|>` vào `reasoning_content` (khi bật `enable_local_thinking`) và tách phần JSON hợp lệ theo GBNF vào `choices[0].message.content`.
-- **Cấu trúc Prompt `nc-agent` (`assemble_context`)**:
-  - `system`: Nội dung `caveman_system.md` + `Role: CODER | PLANNER | REVIEWER`.
-  - `user`: Các block ngăn nắp theo thứ tự: `## REPO_MAP`, `## LEDGER`, `## TASK`, `## SCRATCHPAD` (gồm `[step N tool]\n...` hoặc receipt bị thu gọn `[step N tool -> receipt]`), và `## NEXT`.
-- **Định dạng JSON Output Bắt buộc**:
-  - Bước gọi tool (`CODER`): `{"thought":"...","action":{"tool":"<name>","args":{...}}}`
-  - Bước trả lời cuối (`CODER` / `REVIEWER`): `{"thought":"...","final":"plain concise answer"}` (tuyệt đối không lồng thêm JSON bên trong `"final"`).
-  - Bước lập kế hoạch (`PLANNER`): `{"goal":"...","decisions":[...],"tasks":[{"id":"T1","title":"...","target_files":["..."],"verify_cmd":null}]}` (tối đa 4 micro-tasks).
+- **Giao thức gọi `llama-server --jinja`**: `nc-agent` gửi `POST /v1/chat/completions` kèm mảng OpenAI `tools` (8 tool chuẩn trong `orchestrator.rs`), `tool_choice: "auto"` và `chat_template_kwargs: {"enable_thinking": true|false}`. `llama-server --jinja` tự dịch sang định dạng `<|tool>declaration:...<tool|>`, tách `<|channel>thought\n...\n<channel|>` vào `reasoning_content`, và tách `<|tool_call>call:...<tool_call|>` thành `message.tool_calls`.
+- **Cấu trúc Prompt `nc-agent`**: `system` theo `caveman_system.md` + `Role: CODER | PLANNER | REVIEWER` (bỏ lời nhắc `"JSON ONLY: {\"thought\":...}"` trong chế độ `NativeTools`); `user` giữ 5 anchor `## REPO_MAP`, `## LEDGER`, `## TASK`, `## SCRATCHPAD`, `## NEXT`; các lượt gọi tool tiếp theo dùng chuẩn `assistant(tool_calls)` -> `role: "tool"`.
 - **Schema Chính xác của 8 Tool trong `orchestrator.rs` (Trọng tâm 3 tool chính + 5 tool phụ)**:
   1. `read_symbol`: `{"path": str, "symbol": str}` — cả 2 bắt buộc.
   2. `search_text`: `{"query": str, "ext"?: str, "max_hits"?: int}` — `query` bắt buộc; `ext` lọc đuôi file (ví dụ `"rs"`, `"py"`), `max_hits` mặc định `15`.
-  3. `edit_file`: `{"path": str, "target": str, "replacement": str}` — cả 3 bắt buộc, `target` phải là chuỗi text khớp chính xác văn bản đang tồn tại (cấm tuyệt đối bịa khóa `start_line`, `end_line`, `content`, `new_content`, `old_str`, `new_str`).
-  4. Tool phụ đi kèm cùng `tool_call_gbnf()`: `read_outline(path: str)`, `read_slice(path: str, start_line: int, end_line: int)`, `list_files(dir?: str, max_entries?: int)`, `write_file(path: str, content: str)`, `run_command(cmd: str)`.
+  3. `edit_file`: `{"path": str, "target": str, "replacement": str}` — cả 3 bắt buộc, `target` phải khớp chính xác text hiện có (cấm tuyệt đối bịa khóa `start_line`, `end_line`, `content`, `new_content`, `old_str`, `new_str`).
+  4. 5 tool phụ: `read_outline(path: str)`, `read_slice(path: str, start_line: int, end_line: int)`, `list_files(dir?: str, max_entries?: int)`, `write_file(path: str, content: str)`, `run_command(cmd: str)`.
 
-### 2.2. Chuẩn Wire Format Gemma 4 & Bẫy `strip_thinking()`
+### 2.2. Chuẩn Wire Format Gemma 4 (`chat_template.jinja` trên Hugging Face)
 
-Dựa trên `chat_template.jinja` của checkpoint chuẩn trên Hugging Face (`haku-nekooo/gemma4-e2b-nuclear-pruned` / `google/gemma-4-E2B-it`):
+Khớp chính xác với `chat_template.jinja` trong `haku-nekooo/gemma4-e2b-nuclear-pruned` / `google/gemma-4-E2B-it`:
 
-- **System turn**: `<bos><|turn>system\n<|think|>{system_prompt}<turn|>\n` (bỏ `<|think|>` khi `enable_thinking=False` — tập train bao gồm ~70% bật thinking và ~30% tắt thinking khớp cờ `enable_local_thinking` của `nc-agent`).
+- **System + Tool declarations**: `<bos><|turn>system\n<|think|>\n{system_prompt}<|tool>declaration:{name}{...}<tool|><turn|>\n` (bỏ `<|think|>\n` khi `enable_thinking=False`; tập train dùng ~70% thinking-on và ~30% thinking-off).
 - **User turn**: `<|turn>user\n{user_content}<turn|>\n`.
-- **Model turn**: `<|turn>model\n<|channel>thought\n{suy_luận_ngắn_gọn}<channel|>{model_content}<turn|>\n` (khi `enable_thinking=False` thì bỏ khối `<|channel>thought...<channel|>`).
-- **Cảnh báo Bẫy `strip_thinking()`**: Macro `strip_thinking(text)` trong `chat_template.jinja` tự động **xóa toàn bộ `<|channel>thought...<channel|>`** khỏi tin nhắn `model` khi gọi `tokenizer.apply_chat_template()`. Vì vậy Step 1–2 bắt buộc dùng `render_gemma4_training_sample()` trong [`formatter.py`](../../src/distill/formatter.py) kèm **assistant-only loss masking** (`labels = -100` trên mọi turn `system` và `user`).
+- **Model turn & Native Tool Loop**:
+  - Suy luận: `<|channel>thought\n{reasoning_content}\n<channel|>`.
+  - Gọi tool: `<|tool_call>call:{name}{k1:<|"|>v1<|"|>,k2:...}<tool_call|>` (khóa sắp theo bảng chữ cái).
+  - Kết quả tool (nằm liền trong lượt model, không ngắt `<turn|>`): `<|tool_response>response:{name}{value:<|"|>...<|"|>}<tool_response|>`, sau đó model tiếp tục `<|channel>thought\n...\n<channel|>` -> trả lời plain text cuối cùng + `<turn|>\n`.
+- **Loss Masking & Parity Test**: `render_gemma4_training_sample()` trong [`formatter.py`](../../src/distill/formatter.py) giữ nguyên toàn bộ khối thinking và xuất `assistant_spans` **loại trừ hoàn toàn `<|tool_response>...<tool_response|>`** (chỉ tính loss trên token do model sinh). Notebook Bước 1 (`step1_distill.ipynb`) bắt buộc kiểm tra khớp từng ký tự với `AutoTokenizer.apply_chat_template(..., tools=..., enable_thinking=True, preserve_thinking=True)` của `haku-nekooo/gemma4-e2b-nuclear-pruned`.
 
 ---
 
@@ -51,11 +48,11 @@ Dựa trên `chat_template.jinja` của checkpoint chuẩn trên Hugging Face (`
 
 ### 3.1. Phân luồng Model & Cơ cấu SFT (~3,500–5,000 mẫu)
 
-1. **Nhóm A (35% — ~1,400–1,750 mẫu) [`gemini-2.5-pro`]: Quỹ đạo `nc-agent` (`Agentic Trajectory`)**
-   - Mô phỏng prompt `## REPO_MAP / ## LEDGER / ## TASK / ## SCRATCHPAD / ## NEXT` với JSON output khớp 100% `tool_call_gbnf()` và `planner_gbnf()`.
+1. **Nhóm A (35% — ~1,400–1,750 mẫu) [`gemini-2.5-pro`]: Quỹ đạo `nc-agent` NativeTools (`Agentic Trajectory`)**
+   - Sinh hội thoại đa lượt hoàn chỉnh: `user` (`## REPO_MAP / ## LEDGER / ## TASK / ## SCRATCHPAD`) -> `assistant` (`reasoning_content` + `tool_calls`) -> `tool` -> `assistant` (`reasoning_content` + câu trả lời plain text gọn).
    - Đánh trực diện vào 3 lỗi:
-     - *Cô lập ngữ cảnh & tôn trọng SCRATCHPAD*: Khi chuyển file/symbol ở `## TASK` mới hoặc đã có `[step N tool -> receipt]` trong `## SCRATCHPAD`, không lặp lại read thừa và không lẫn symbol cũ.
-     - *Kỷ luật tham số & chống lồng JSON*: `edit_file` luôn dùng đúng `path`, `target`, `replacement`; `"final"` luôn là văn bản sạch, không nhét JSON lồng nhau.
+     - *Cô lập ngữ cảnh & tôn trọng SCRATCHPAD*: Khi chuyển file/symbol ở `## TASK` mới hoặc đã có `[step N tool -> receipt]` trong `## SCRATCHPAD`, gọi tool đúng mục tiêu mới, không lặp lại read cũ.
+     - *Kỷ luật tham số & chống rò JSON*: `edit_file` luôn dùng đúng `path`, `target`, `replacement`; câu trả lời cuối luôn là plain text, không rò JSON envelope.
      - *Bảo toàn kiểu dữ liệu & signature*: Giữ nguyên `i32` trong Rust, `int32_t` trong C++, interface TS khi sửa logic bằng `edit_file` hoặc `write_file`.
 
 2. **Nhóm B (25% — ~900–1,250 mẫu) [`gemini-2.5-flash`]: Giải thích Code & Debug Song ngữ Anh–Việt**
@@ -77,7 +74,7 @@ Mọi mẫu sinh từ Gemini đều phải vượt qua bộ kiểm duyệt quy�
 
 - **Cấm 100% Unicode Emoji**: Dùng lại `is_emoji_or_banned_symbol()` từ [`vocab_filter.py`](../../src/surgery/vocab_filter.py) để loại bỏ mọi mẫu chứa emoji, pictograph, ZWJ (`U+200D`) hoặc variation selector (`U+FE00..U+FE0F`) ở mọi trường.
 - **Vùng cấm ASCII Emoticon**: Chặn tuyệt đối ASCII emoticon trong `<|channel>thought...<channel|>`, mọi code block ```` ```...``` ````, và toàn bộ đầu ra chế độ `nc_agent`. Chỉ cho phép ở văn bản prose của chế độ `chat`.
-- **Kiểm tra GBNF Envelope & Schema `nc-agent`**: Parse JSON nghiêm ngặt, kiểm tra `thought` + (`action` XOR `final`) hoặc schema `PLANNER`, kiểm tra đúng tên tool + kiểu tham số của 8 tool trong `orchestrator.rs`, chặn khóa bịa (`start_line`/`content` trong `edit_file`) và chặn lồng JSON trong `"final"`.
+- **Kiểm tra NativeTools & Schema `nc-agent`**: Xác thực mọi `tool_calls` trong lượt assistant khớp đúng tên tool + kiểu tham số của 8 tool trong `orchestrator.rs`, chặn khóa bịa (`start_line`/`content` trong `edit_file`), chặn rò JSON wrapper trong `content`, và kiểm tra `role == "tool"` hợp lệ.
 - **Chống lặp & Độ dài**: Chặn vòng lặp n-gram trong thought/answer; check cân bằng thẻ Gemma 4; dùng tokenizer `haku-nekooo/gemma4-e2b-nuclear-pruned` kiểm tra độ dài `<= 4096` token và `0` `<unk>`; loại mẫu trùng bằng hash.
 
 ### 3.3. Tập `Preference Pair` cho ORPO (~500–800 cặp) [`gemini-2.5-pro` + lỗi thật Bước 0]
@@ -121,9 +118,9 @@ Mọi mẫu sinh từ Gemini đều phải vượt qua bộ kiểm duyệt quy�
    - `model-text-code-v1-Q5_K_M.gguf` (~1.9 GB, dự phòng chất lượng cao).
    - `mmproj-vision-audio-v1-bf16.gguf` (~0.92 GB).
 2. **Bộ Kiểm chứng Hồi quy Agentic (`src/train/eval_agentic.py`, 25–30 test case)**:
-   - Chấm điểm so sánh đối chiếu trực tiếp với baseline mới trong `brain/` (`gemma-4-E2B-it-Q4_K_M.gguf` + `mmproj-F16.gguf`) qua `llama-server --jinja` + `tool_call_gbnf()`:
+   - Chấm điểm so sánh đối chiếu trực tiếp với baseline mới trong `brain/` (`gemma-4-E2B-it-Q4_K_M.gguf` + `mmproj-F16.gguf`) qua `llama-server --jinja` ở chế độ **`NativeTools`** (gửi mảng `tools` chuẩn OpenAI):
      1. Cô lập ngữ cảnh đa lượt & không lặp `## SCRATCHPAD`.
-     2. Kỷ luật schema 8 tool (`read_symbol`, `search_text`, `edit_file`...), `0` JSON lồng trong `"final"`.
+     2. Kỷ luật schema 8 tool (`read_symbol`, `search_text`, `edit_file`...), `0` JSON rò ra prose.
      3. Bảo toàn kiểu dữ liệu (`i32` trong Rust, `int32_t` trong C++, strict TS).
      4. Giải thích song ngữ EN–VI chuẩn thuật ngữ, không lặp chữ, `0` Unicode emoji, tuân thủ vùng cấm ASCII emoticon.
      5. Smoke test mount `--mmproj` với ảnh code mẫu.
@@ -132,10 +129,10 @@ Mọi mẫu sinh từ Gemini đều phải vượt qua bộ kiểm duyệt quy�
 
 ## 6. Cấu trúc Mã nguồn & Quyết định Đã Chốt
 
-- `src/distill/`: `nc_schema.py` (schema thật từ `nc-agent` + `validate_nc_envelope`), `formatter.py` (`render_gemma4_training_sample` + `render_gemma4_orpo_pair`), `validator.py` (chặn emoji/vùng cấm emoticon/anti-loop/token length), `prompts.py` (sinh prompt pool định tuyến `gemini-2.5-pro` & `gemini-2.5-flash`), `gemini_batch.py` (`google-genai` Batch API JSONL + Sync smoke + parser), `cli.py`.
+- `src/distill/`: `nc_schema.py` (`get_nc_openai_tools` + `validate_tool_call` khớp `nc-agent`), `formatter.py` (`render_gemma4_training_sample` + `render_gemma4_orpo_pair` khớp `chat_template.jinja`), `validator.py` (chặn emoji/vùng cấm emoticon/anti-loop/token length), `prompts.py` (định tuyến `gemini-2.5-pro` & `gemini-2.5-flash`), `gemini_batch.py`, `cli.py`.
 - `src/train/`: Pipeline Stage 2A SFT + Stage 2B ORPO + SHA-256 Vision/Audio verifier + `eval_agentic.py`.
-- `notebooks/`: `step1_distill.ipynb` (nếu cần chạy từ Colab), `step2_train_qlora_orpo.ipynb`.
+- `notebooks/`: `step1_distill.ipynb` (Parity Check + Gemini Sync Smoke + Batch API), `step2_train_qlora_orpo.ipynb`.
 - **Các điểm đầu vào đã chốt xong**:
   1. Schema tool trích trực tiếp từ `D:\Coding\nuclear_code\crates\nc-agent\src\orchestrator.rs` & `context.rs`.
-  2. `nc-agent` gọi `llama-server --jinja` qua `/v1/chat/completions` với GBNF grammar (`providers.rs`).
+  2. `nc-agent` nâng cấp sang `NativeTools` gọi `llama-server --jinja` với mảng `tools` OpenAI (`CHANGE-SUGGESTIONS.md`).
   3. Dùng `gemini-2.5-pro` (nhóm Agentic/Code/ORPO) + `gemini-2.5-flash` (Giải thích/Hỏi lại/Chat) qua Gemini Batch API (`google-genai`).
