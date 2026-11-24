@@ -5,10 +5,25 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .bpe_closure import parse_merges
 from .vocab_filter import is_unused_token
+
+REQUIRED_PROCESSOR_FILES: tuple[str, ...] = (
+    "processor_config.json",
+)
+OPTIONAL_PROCESSOR_FILES: tuple[str, ...] = (
+    "preprocessor_config.json",
+    "image_processor_config.json",
+    "feature_extractor_config.json",
+    "audio_processor_config.json",
+)
+DEFAULT_PROCESSOR_FALLBACK_REPOS: tuple[str, ...] = (
+    "google/gemma-4-E2B-it",
+    "Austriani/Gemma-4-E2B-it-ARA-Abliterated",
+    "unsloth/gemma-4-E2B-it",
+)
 
 CRITICAL_SPECIAL_TOKENS: tuple[str, ...] = (
     "<pad>",
@@ -41,12 +56,75 @@ CRITICAL_SPECIAL_TOKENS: tuple[str, ...] = (
 _TOKEN_KEY_RE = re.compile(r"(?:^vocab_size(?:_per_layer_input)?$|_token_ids?$|_token_index$)")
 
 
+def ensure_processor_configs(
+    local_dir: str | Path,
+    fallback_repos: tuple[str, ...] = DEFAULT_PROCESSOR_FALLBACK_REPOS,
+    token: str | None = None,
+    download_fn: Callable[[str, str, Path, str | None], Any] | None = None,
+) -> dict[str, Any]:
+    """Backfill missing multimodal processor configs from official/mirror Gemma 4 repos."""
+    out = Path(local_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    missing_req = [f for f in REQUIRED_PROCESSOR_FILES if not (out / f).exists()]
+    if not missing_req:
+        return {"backfilled": [], "sources": {}, "missing_required": []}
+
+    if download_fn is None:
+        from huggingface_hub import hf_hub_download
+
+        def _hf_dl(repo_id: str, filename: str, target_dir: Path, tok: str | None) -> Any:
+            return hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(target_dir),
+                token=tok,
+            )
+
+        download_fn = _hf_dl
+
+    candidates = (*REQUIRED_PROCESSOR_FILES, *OPTIONAL_PROCESSOR_FILES)
+    backfilled: list[str] = []
+    sources: dict[str, str] = {}
+    errors: dict[str, str] = {}
+
+    for repo_id in fallback_repos:
+        still_missing = [f for f in candidates if not (out / f).exists()]
+        if not still_missing or all((out / f).exists() for f in REQUIRED_PROCESSOR_FILES):
+            break
+        for fname in still_missing:
+            try:
+                download_fn(repo_id, fname, out, token)
+                if (out / fname).exists():
+                    backfilled.append(fname)
+                    sources[fname] = repo_id
+            except Exception as exc:  # noqa: BLE001 - gated repo (401/403) or missing optional file (404)
+                errors[f"{repo_id}/{fname}"] = str(exc)
+        if all((out / f).exists() for f in REQUIRED_PROCESSOR_FILES):
+            break
+
+    final_missing = [f for f in REQUIRED_PROCESSOR_FILES if not (out / f).exists()]
+    if backfilled:
+        print(f"Backfilled missing processor config(s): {sources}")
+    if final_missing:
+        print(
+            f"WARNING: Required processor config(s) still missing after fallbacks: {final_missing}. "
+            f"Errors sample: {list(errors.items())[:3]}"
+        )
+    return {
+        "backfilled": backfilled,
+        "sources": sources,
+        "missing_required": final_missing,
+    }
+
+
 def download_metadata_only(
     repo_id: str,
     local_dir: str | Path,
     token: str | None = None,
+    fallback_repos: tuple[str, ...] = DEFAULT_PROCESSOR_FALLBACK_REPOS,
 ) -> Path:
-    """Download only config, tokenizer, and index metadata (~30 MB, zero weight shards)."""
+    """Download config, tokenizer, and index metadata (~30 MB), backfilling processor configs."""
     from huggingface_hub import snapshot_download
 
     out = Path(local_dir)
@@ -57,6 +135,7 @@ def download_metadata_only(
         token=token,
         allow_patterns=["*.json", "*.jinja", "tokenizer.model", "*.txt"],
     )
+    ensure_processor_configs(out, fallback_repos=fallback_repos, token=token)
     return out
 
 
@@ -148,6 +227,11 @@ def inspect_checkpoint_metadata(
         if "embed_tokens" in tensor_name or "lm_head" in tensor_name:
             vocab_shards.setdefault(shard_name, []).append(tensor_name)
 
+    processor_files_present = [
+        f for f in (*REQUIRED_PROCESSOR_FILES, *OPTIONAL_PROCESSOR_FILES) if (root / f).exists()
+    ]
+    missing_processor_files = [f for f in REQUIRED_PROCESSOR_FILES if not (root / f).exists()]
+
     summary = {
         "model_dir": str(root),
         "config_fields": config_fields,
@@ -158,6 +242,8 @@ def inspect_checkpoint_metadata(
         ),
         "has_vision_config": "vision_config" in config,
         "has_audio_config": "audio_config" in config,
+        "processor_files_present": processor_files_present,
+        "missing_processor_files": missing_processor_files,
         "tokenizer_model_present": tok_model_bytes is not None,
         "tokenizer_model_bytes": tok_model_bytes,
         "tokenizer_type": tok_type,
@@ -177,6 +263,10 @@ def inspect_checkpoint_metadata(
         print("=== PREFLIGHT CHECKPOINT INSPECTION ===")
         print(f"Dir: {summary['model_dir']}")
         print(f"tie_word_embeddings={summary['tie_word_embeddings']} | vision={summary['has_vision_config']} | audio={summary['has_audio_config']}")
+        print(
+            f"Processor files present: {processor_files_present}"
+            + (f" | MISSING REQUIRED: {missing_processor_files}" if missing_processor_files else "")
+        )
         print("Config vocab/token_id fields (root + nested):")
         for k, v in sorted(config_fields.items()):
             print(f"  {k}: {v}")

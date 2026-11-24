@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .vocab_filter import CRITICAL_TOKEN_STRINGS
+
 AUX_METADATA_FILES: tuple[str, ...] = (
     "processor_config.json",
     "preprocessor_config.json",
@@ -93,7 +95,8 @@ def _rewrite_tokenizer_json(
     old_vocab_by_id: dict[int, str],
     id_map: dict[int, int],
     pruned_merges_raw: list,
-) -> dict[str, Any]:
+    mandatory_added_tokens: tuple[str, ...] = CRITICAL_TOKEN_STRINGS,
+) -> tuple[dict[str, Any], list[str]]:
     out = copy.deepcopy(src_tok)
     model = out["model"]
     orig_model_ids = set((model.get("vocab") or {}).values())
@@ -105,28 +108,58 @@ def _rewrite_tokenizer_json(
     }
     model["merges"] = pruned_merges_raw
 
-    if "added_tokens" in out and isinstance(out["added_tokens"], list):
-        new_added = []
-        for entry in out["added_tokens"]:
-            oid = entry.get("id")
-            if isinstance(oid, int) and oid in id_map:
-                updated = dict(entry)
-                updated["id"] = id_map[oid]
-                new_added.append(updated)
-        new_added.sort(key=lambda item: item["id"])
-        out["added_tokens"] = new_added
+    new_added: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    seen_contents: set[str] = set()
+    for entry in out.get("added_tokens") or []:
+        oid = entry.get("id")
+        if isinstance(oid, int) and oid in id_map:
+            updated = dict(entry)
+            new_id = id_map[oid]
+            updated["id"] = new_id
+            new_added.append(updated)
+            seen_ids.add(new_id)
+            content = updated.get("content")
+            if isinstance(content, str):
+                seen_contents.add(content)
 
-    return out
+    # Guarantee mandatory special/multimodal tokens (esp. ID 5 [multimodal] which has token_type=1)
+    # are registered in added_tokens so BPE never splits them into sub-tokens.
+    new_id_by_tok = {old_vocab_by_id[oid]: nid for oid, nid in id_map.items()}
+    injected_tokens: list[str] = []
+    for tok_str in mandatory_added_tokens:
+        new_id = new_id_by_tok.get(tok_str)
+        if new_id is None or new_id in seen_ids or tok_str in seen_contents:
+            continue
+        new_added.append(
+            {
+                "id": new_id,
+                "content": tok_str,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": tok_str not in ("<bbox>", "</bbox>"),
+            }
+        )
+        seen_ids.add(new_id)
+        seen_contents.add(tok_str)
+        injected_tokens.append(tok_str)
+
+    new_added.sort(key=lambda item: item["id"])
+    out["added_tokens"] = new_added
+    return out, injected_tokens
 
 
 def _rewrite_tokenizer_config(
     src_tok_cfg: dict[str, Any],
     id_map: dict[int, int],
+    added_tokens: list[dict[str, Any]],
 ) -> dict[str, Any]:
     out = copy.deepcopy(src_tok_cfg)
     decoder = out.get("added_tokens_decoder")
+    new_decoder: dict[str, Any] = {}
     if isinstance(decoder, dict):
-        new_decoder: dict[str, Any] = {}
         for old_key, val in decoder.items():
             try:
                 oid = int(old_key)
@@ -134,7 +167,22 @@ def _rewrite_tokenizer_config(
                 continue
             if oid in id_map:
                 new_decoder[str(id_map[oid])] = val
-        out["added_tokens_decoder"] = new_decoder
+
+    for entry in added_tokens:
+        key = str(entry["id"])
+        if key not in new_decoder:
+            new_decoder[key] = {
+                "content": entry["content"],
+                "lstrip": bool(entry.get("lstrip", False)),
+                "normalized": bool(entry.get("normalized", False)),
+                "rstrip": bool(entry.get("rstrip", False)),
+                "single_word": bool(entry.get("single_word", False)),
+                "special": bool(entry.get("special", True)),
+            }
+
+    out["added_tokens_decoder"] = dict(
+        sorted(new_decoder.items(), key=lambda kv: int(kv[0]))
+    )
     return out
 
 
@@ -184,15 +232,23 @@ def remap_and_save_metadata(
         )
 
     # 3. Rewrite tokenizer.json and tokenizer_config.json.
-    new_tok_json = _rewrite_tokenizer_json(tok_json, old_vocab_by_id, id_map, pruned_merges_raw)
+    new_tok_json, injected_tokens = _rewrite_tokenizer_json(
+        tok_json, old_vocab_by_id, id_map, pruned_merges_raw
+    )
     (dst / "tokenizer.json").write_text(
         json.dumps(new_tok_json, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
     tok_cfg_path = src / "tokenizer_config.json"
-    if tok_cfg_path.exists():
-        src_tok_cfg = json.loads(tok_cfg_path.read_text(encoding="utf-8"))
-        new_tok_cfg = _rewrite_tokenizer_config(src_tok_cfg, id_map)
+    if tok_cfg_path.exists() or new_tok_json.get("added_tokens"):
+        src_tok_cfg = (
+            json.loads(tok_cfg_path.read_text(encoding="utf-8"))
+            if tok_cfg_path.exists()
+            else {}
+        )
+        new_tok_cfg = _rewrite_tokenizer_config(
+            src_tok_cfg, id_map, new_tok_json.get("added_tokens") or []
+        )
         (dst / "tokenizer_config.json").write_text(
             json.dumps(new_tok_cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
@@ -215,11 +271,19 @@ def remap_and_save_metadata(
     if dst_spm.exists():
         dst_spm.unlink()
 
+    missing_processor_files = [
+        fname
+        for fname in ("processor_config.json",)
+        if not (dst / fname).exists()
+    ]
+
     return {
         "new_vocab_size": new_vocab_size,
         "config_changes": cfg_changes,
         "generation_changes": gen_changes,
+        "injected_added_tokens": injected_tokens,
         "copied_auxiliary_files": copied_aux,
+        "missing_processor_files": missing_processor_files,
         "tokenizer_model_present_in_src": src_has_spm,
         "tokenizer_model_action": "removed_use_tokenizer_json_only",
     }

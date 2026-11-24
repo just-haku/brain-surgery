@@ -27,7 +27,7 @@ from surgery.config_remap import (  # noqa: E402
     remap_and_save_metadata,
     remap_config_dict,
 )
-from surgery.preflight import inspect_checkpoint_metadata  # noqa: E402
+from surgery.preflight import ensure_processor_configs, inspect_checkpoint_metadata  # noqa: E402
 from surgery.vocab_filter import (  # noqa: E402
     collect_mandatory_whitelist,
     is_ascii_vi_code_candidate,
@@ -182,7 +182,6 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
                     "merges": [],
                 },
                 "added_tokens": [
-                    {"id": 5, "content": "[multimodal]", "special": False},
                     {"id": 258880, "content": "<|image|>", "special": True},
                 ],
             }
@@ -198,11 +197,13 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
             (src / "generation_config.json").write_text(json.dumps(gen_cfg), encoding="utf-8")
             (src / "tokenizer.json").write_text(json.dumps(tok_json), encoding="utf-8")
             (src / "tokenizer_config.json").write_text(json.dumps(tok_cfg), encoding="utf-8")
+            (src / "processor_config.json").write_text("{\"processor_class\": \"Gemma4Processor\"}", encoding="utf-8")
             (src / "tokenizer.model").write_bytes(b"fake-spm-protobuf")
 
             summary = inspect_checkpoint_metadata(src, verbose=False)
             self.assertTrue(summary["tokenizer_model_present"])
             self.assertEqual(summary["special_ids"]["[multimodal]"], 5)
+            self.assertEqual(summary["missing_processor_files"], [])
 
             kept_old_ids = [0, 1, 2, 3, 4, 5, 98, 106, 255999, 258880, 258881, 258882]
             id_map = build_id_map(kept_old_ids)
@@ -210,6 +211,19 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
 
             self.assertFalse((dst / "tokenizer.model").exists())
             self.assertEqual(remap_report["tokenizer_model_action"], "removed_use_tokenizer_json_only")
+            self.assertEqual(remap_report["missing_processor_files"], [])
+            self.assertIn("processor_config.json", remap_report["copied_auxiliary_files"])
+            self.assertTrue((dst / "processor_config.json").exists())
+            self.assertIn("[multimodal]", remap_report["injected_added_tokens"])
+
+            new_tok_json = json.loads((dst / "tokenizer.json").read_text(encoding="utf-8"))
+            added_by_content = {e["content"]: e for e in new_tok_json["added_tokens"]}
+            self.assertIn("[multimodal]", added_by_content)
+            self.assertEqual(added_by_content["[multimodal]"]["id"], id_map[5])
+            self.assertFalse(added_by_content["[multimodal]"]["normalized"])
+            self.assertTrue(added_by_content["[multimodal]"]["special"])
+            self.assertEqual(added_by_content["<|think|>"]["id"], id_map[98])
+            self.assertEqual(added_by_content["<|audio|>"]["id"], id_map[258881])
 
             new_cfg = json.loads((dst / "config.json").read_text(encoding="utf-8"))
             assert_no_oob_token_ids(new_cfg, len(kept_old_ids))
@@ -224,12 +238,34 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
             new_tok_cfg = json.loads((dst / "tokenizer_config.json").read_text(encoding="utf-8"))
             self.assertNotIn("200", new_tok_cfg["added_tokens_decoder"])
             self.assertIn(str(id_map[258880]), new_tok_cfg["added_tokens_decoder"])
+            self.assertIn(str(id_map[5]), new_tok_cfg["added_tokens_decoder"])
+            self.assertEqual(new_tok_cfg["added_tokens_decoder"][str(id_map[5])]["content"], "[multimodal]")
+            self.assertFalse(new_tok_cfg["added_tokens_decoder"][str(id_map[5])]["normalized"])
 
             # Verify remap_config_dict fails loudly if a required token ID was pruned.
             bad_map = dict(id_map)
             del bad_map[258881]
             with self.assertRaises(KeyError):
                 remap_config_dict(cfg, bad_map, len(bad_map))
+
+    def test_ensure_processor_configs_fallback_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "ckpt"
+            target.mkdir()
+
+            def fake_download(repo_id: str, filename: str, out_dir: Path, token: str | None) -> None:
+                if repo_id == "google/gemma-4-E2B-it":
+                    raise PermissionError("401 gated repo")
+                if repo_id == "Austriani/Gemma-4-E2B-it-ARA-Abliterated" and filename == "processor_config.json":
+                    (out_dir / filename).write_text("{}", encoding="utf-8")
+
+            res = ensure_processor_configs(
+                target,
+                fallback_repos=("google/gemma-4-E2B-it", "Austriani/Gemma-4-E2B-it-ARA-Abliterated"),
+                download_fn=fake_download,
+            )
+            self.assertEqual(res["missing_required"], [])
+            self.assertEqual(res["sources"]["processor_config.json"], "Austriani/Gemma-4-E2B-it-ARA-Abliterated")
 
 
 @unittest.skipUnless(GGUF_BASELINE.exists(), "Baseline GGUF not present in brain/")
