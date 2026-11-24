@@ -24,14 +24,19 @@ from distill.gemini_batch import (  # noqa: E402
     write_batch_jsonl_by_model,
 )
 from distill.nc_schema import (  # noqa: E402
+    FINAL_STEP_PROMPT,
+    WORKER_CODER_TOOLS,
     build_nc_system_prompt,
     build_nc_user_prompt,
+    format_repo_map_dir,
+    format_repo_map_file,
     get_nc_openai_tools,
     validate_tool_call,
 )
 from distill.prompts import MODEL_FLASH, MODEL_PRO, generate_seed_tasks  # noqa: E402
 from distill.validator import (  # noqa: E402
     contains_ascii_emoticon,
+    convert_and_validate_openai_jsonl,
     has_repetition_loop,
     validate_orpo_pair,
     validate_sft_sample,
@@ -43,17 +48,47 @@ STEP1_NOTEBOOK = ROOT / "notebooks" / "step1_distill.ipynb"
 class TestNcSchema(unittest.TestCase):
     def test_openai_tool_specs_and_validation(self) -> None:
         tools = get_nc_openai_tools()
-        self.assertEqual(len(tools), 8)
+        self.assertEqual(len(tools), 9)
+        worker_tools = get_nc_openai_tools(depth=1)
+        self.assertEqual(len(worker_tools), len(WORKER_CODER_TOOLS))
+        self.assertNotIn("spawn_subagent", [t["function"]["name"] for t in worker_tools])
+
         by_name = {t["function"]["name"]: t["function"] for t in tools}
         self.assertEqual(by_name["read_symbol"]["parameters"]["required"], ["path", "symbol"])
         self.assertEqual(by_name["search_text"]["parameters"]["required"], ["query"])
+        self.assertEqual(
+            by_name["read_slice"]["parameters"]["required"],
+            ["path", "start_line", "end_line"],
+        )
+        self.assertEqual(
+            by_name["spawn_subagent"]["parameters"]["required"],
+            ["role", "task", "files"],
+        )
         self.assertEqual(
             by_name["edit_file"]["parameters"]["required"],
             ["path", "target", "replacement"],
         )
 
         self.assertEqual(validate_tool_call("read_symbol", {"path": "src/lib.rs", "symbol": "parse"}), [])
+        self.assertEqual(
+            validate_tool_call("read_slice", {"path": "src/lib.rs", "start_line": 1, "end_line": 20}),
+            [],
+        )
         self.assertEqual(validate_tool_call("search_text", {"query": "edit_file", "ext": "rs", "max_hits": 10}), [])
+        self.assertEqual(
+            validate_tool_call(
+                "spawn_subagent",
+                {"role": "explorer", "task": "Inspect types", "files": ["src/lib.rs"]},
+            ),
+            [],
+        )
+        self.assertEqual(
+            validate_tool_call(
+                "spawn_subagent",
+                {"role": "explorer", "task": "Scan workspace", "files": []},
+            ),
+            [],
+        )
         self.assertEqual(
             validate_tool_call(
                 "edit_file",
@@ -64,7 +99,14 @@ class TestNcSchema(unittest.TestCase):
 
         bad_calls = [
             ("edit_file", {"path": "a.rs", "start_line": 1, "content": "x"}),
+            ("edit_file", {"path": "a.rs", "target": "old", "replacement": "new", "content": "whole"}),
+            ("edit_file", {"path": "a.rs", "target": "same", "replacement": "same"}),
             ("edit_file", {"path": "a.rs", "target": "", "replacement": "x"}),
+            ("read_slice", {"path": "a.rs"}),
+            ("read_slice", {"path": "a.rs", "start_line": 20, "end_line": 10}),
+            ("spawn_subagent", {"role": "explorer", "task": "Missing files"}),
+            ("spawn_subagent", {"role": "admin", "task": "Nope", "files": []}),
+            ("spawn_subagent", {"role": "coder", "task": "Ok", "files": "a.rs"}),
             ("search_text", {"query": "foo", "max_hits": True}),
             ("search_text", {"query": "foo", "max_hits": 0}),
             ("unknown_tool", {"path": "a.rs"}),
@@ -73,23 +115,52 @@ class TestNcSchema(unittest.TestCase):
             self.assertTrue(validate_tool_call(tname, targs), f"expected errors for {tname} {targs}")
 
     def test_system_and_user_prompts(self) -> None:
-        sys_p = build_nc_system_prompt("coder")
-        self.assertNotIn("JSON ONLY", sys_p)
-        self.assertIn("Always read before edit_file", sys_p)
+        sys_lead = build_nc_system_prompt("coder", depth=0)
+        self.assertNotIn("JSON ONLY", sys_lead)
+        self.assertIn("Always read exact text before edit_file", sys_lead)
+        self.assertIn("spawn_subagent", sys_lead)
 
-        prompt = build_nc_user_prompt(
-            repo_map="src/lib.rs: parse, run",
+        sys_worker = build_nc_system_prompt("coder", depth=1)
+        self.assertNotIn("spawn_subagent", sys_worker)
+
+        self.assertEqual(
+            format_repo_map_file("src/lib.rs", 45, [("parse", 10), ("run", 28)]),
+            "src/lib.rs: parse@10, run@28 [45L]",
+        )
+        self.assertEqual(format_repo_map_file("README.md", 12), "README.md: [12L]")
+        self.assertEqual(
+            format_repo_map_dir("crates/auth/", 18, 9400, 42),
+            "crates/auth/ [18f, 9400L, 42 syms]",
+        )
+        self.assertEqual(
+            FINAL_STEP_PROMPT,
+            "[FINAL STEP] Answer TASK concisely in plain text now; do not call tools.",
+        )
+
+        native_prompt = build_nc_user_prompt(
+            code_graph="src/lib.rs:L10 fn parse | called_by: run@src/main.rs",
+            repo_map=format_repo_map_file("src/lib.rs", 45, [("parse", 10)]),
             ledger="goal: fix parser",
+            task="Fix parse()",
+        )
+        for header in ("## REPO_MAP", "[CODE_GRAPH 1-HOP]", "[FILES]", "## LEDGER", "## TASK"):
+            self.assertIn(header, native_prompt)
+        self.assertNotIn("## SCRATCHPAD", native_prompt)
+        self.assertNotIn("## NEXT", native_prompt)
+
+        legacy_prompt = build_nc_user_prompt(
+            repo_map="src/lib.rs: [45L]",
             task="Fix parse()",
             scratchpad_entries=[
                 {"step": 1, "tool": "read_outline", "evicted": True, "receipt": "outline src/lib.rs"},
                 {"step": 2, "tool": "read_symbol", "evicted": False, "raw_output": "fn parse() -> i32 { 0 }"},
             ],
+            legacy_gbnf=True,
         )
-        for header in ("## REPO_MAP", "## LEDGER", "## TASK", "## SCRATCHPAD", "## NEXT"):
-            self.assertIn(header, prompt)
-        self.assertIn("[step 1 read_outline -> outline src/lib.rs]", prompt)
-        self.assertIn("[step 2 read_symbol]\nfn parse() -> i32 { 0 }", prompt)
+        for header in ("## REPO_MAP", "## TASK", "## SCRATCHPAD", "## NEXT"):
+            self.assertIn(header, legacy_prompt)
+        self.assertIn("[step 1 read_outline -> outline src/lib.rs]", legacy_prompt)
+        self.assertIn("[step 2 read_symbol]\nfn parse() -> i32 { 0 }", legacy_prompt)
 
 
 class TestGemma4Formatter(unittest.TestCase):
@@ -257,6 +328,165 @@ class TestValidatorPolicy(unittest.TestCase):
 
         loop_txt = ("kiểm tra biến này trong hàm xử lý lỗi " * 4).strip()
         self.assertTrue(has_repetition_loop(loop_txt))
+
+    def test_adaptive_thinking_caps_duplicate_reads_and_openai_ingest(self) -> None:
+        too_long_reason = "x" * 241
+        over_cap = {
+            "id": "over_cap",
+            "thinking": True,
+            "messages": [
+                {"role": "system", "content": build_nc_system_prompt("coder")},
+                {"role": "user", "content": build_nc_user_prompt(task="Explain add()")},
+                {"role": "assistant", "reasoning_content": too_long_reason, "content": "Done."},
+            ],
+        }
+        self.assertTrue(any("240" in e for e in validate_sft_sample(over_cap)))
+
+        leaked_thought_when_off = {
+            "id": "leak_off",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": build_nc_system_prompt("coder")},
+                {"role": "user", "content": build_nc_user_prompt(task="Hi")},
+                {"role": "assistant", "reasoning_content": "Should be null", "content": "Hi."},
+            ],
+        }
+        self.assertTrue(any("thinking=False" in e for e in validate_sft_sample(leaked_thought_when_off)))
+
+        dup_read = {
+            "id": "dup_read",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": build_nc_system_prompt("coder")},
+                {"role": "user", "content": build_nc_user_prompt(task="Check add()")},
+                {
+                    "role": "assistant",
+                    "reasoning_content": None,
+                    "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "read_symbol", "arguments": '{"path":"src/lib.rs","symbol":"add"}'}}
+                    ],
+                    "content": None,
+                },
+                {"role": "tool", "tool_call_id": "c1", "name": "read_symbol", "content": "fn add() {}"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": None,
+                    "tool_calls": [
+                        {"id": "c2", "type": "function", "function": {"name": "read_symbol", "arguments": '{"path":"src/lib.rs","symbol":"add"}'}}
+                    ],
+                    "content": None,
+                },
+                {"role": "tool", "tool_call_id": "c2", "name": "read_symbol", "content": "fn add() {}"},
+                {"role": "assistant", "reasoning_content": None, "content": "Done."},
+            ],
+        }
+        self.assertTrue(any("duplicate consecutive read call" in e for e in validate_sft_sample(dup_read)))
+
+        bad_scratchpad_native = {
+            "id": "bad_scratchpad",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": build_nc_system_prompt("coder")},
+                {"role": "user", "content": "## REPO_MAP\nsrc/lib.rs: [10L]\n\n## TASK\nFix\n\n## SCRATCHPAD\nok"},
+                {"role": "assistant", "reasoning_content": None, "content": "Done."},
+            ],
+        }
+        self.assertTrue(
+            any("SCRATCHPAD" in e for e in validate_sft_sample(bad_scratchpad_native))
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            raw_in = tmp_dir / "agy_in.jsonl"
+            sft_fast = {
+                "id": "agy_sft_1",
+                "bucket": "A_nc_agent",
+                "thinking": False,
+                "ctx_profile": "8k",
+                "messages": [
+                    {"role": "system", "content": build_nc_system_prompt("coder", depth=0)},
+                    {"role": "user", "content": build_nc_user_prompt(code_graph="src/lib.rs:L1 fn add", task="Fix add")},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": None,
+                        "tool_calls": [
+                            {"id": "c1", "type": "function", "function": {"name": "search_text", "arguments": '{"query":"add_old"}'}}
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "name": "search_text", "content": ""},
+                    {"role": "user", "content": FINAL_STEP_PROMPT},
+                    {"role": "assistant", "content": "`add` increments `x: i32` by `1`.", "reasoning_content": None},
+                ],
+            }
+            sft_planner = {
+                "id": "agy_planner_1",
+                "bucket": "planner_dag",
+                "grammar": "planner",
+                "thinking": False,
+                "ctx_profile": "8k",
+                "messages": [
+                    {"role": "system", "content": build_nc_system_prompt("planner")},
+                    {"role": "user", "content": build_nc_user_prompt(task="Split work")},
+                    {
+                        "role": "assistant",
+                        "reasoning_content": None,
+                        "content": json.dumps(
+                            {
+                                "goal": "Split work",
+                                "decisions": ["Keep i32"],
+                                "tasks": [{"id": "T1", "title": "Update add", "target_files": ["src/lib.rs"], "verify_cmd": "cargo test"}],
+                            }
+                        ),
+                    },
+                ],
+            }
+            orpo_runaway = {
+                "id": "agy_orpo_1",
+                "bucket": "no_thinking_tool_vs_runaway_cot",
+                "prompt": [
+                    {"role": "system", "content": build_nc_system_prompt("coder", depth=0)},
+                    {"role": "user", "content": build_nc_user_prompt(task="Inspect add")},
+                ],
+                "chosen": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "read_symbol", "arguments": '{"path":"src/lib.rs","symbol":"add"}'}}
+                    ],
+                },
+                "rejected": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "Let me think endlessly about many hypothetical edge cases before doing anything.",
+                },
+            }
+            raw_in.write_text(
+                "\n".join([json.dumps(sft_fast), json.dumps(sft_planner), json.dumps(orpo_runaway)]) + "\n",
+                encoding="utf-8",
+            )
+            rep = convert_and_validate_openai_jsonl(
+                [raw_in],
+                tmp_dir / "sft.jsonl",
+                tmp_dir / "orpo.jsonl",
+                tmp_dir / "rej.jsonl",
+            )
+            self.assertEqual(rep["kept_sft"], 2)
+            self.assertEqual(rep["kept_orpo"], 1)
+            self.assertEqual(rep["rejected_count"], 0)
+            self.assertEqual(rep["thinking_true_ratio"], 0.0)
+            sft_out_rows = [
+                json.loads(line)
+                for line in (tmp_dir / "sft.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            fast_row = sft_out_rows[0]
+            self.assertNotIn("<turn|>", [fast_row["text"][s:e] for s, e in fast_row["assistant_spans"]])
+            self.assertIn(FINAL_STEP_PROMPT, fast_row["text"])
+            self.assertNotIn("<|tool>", sft_out_rows[1]["text"])
+            orpo_row = json.loads((tmp_dir / "orpo.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertNotIn("<|channel>thought", orpo_row["chosen"])
+            self.assertIn("<|channel>thought", orpo_row["rejected"])
 
 
 class TestPromptsBatchAndNotebook(unittest.TestCase):

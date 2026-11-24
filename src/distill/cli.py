@@ -14,10 +14,11 @@ from .gemini_batch import (
     write_batch_jsonl_by_model,
 )
 from .prompts import generate_seed_tasks
+from .validator import convert_and_validate_openai_jsonl
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Step 1 Gemini distillation CLI")
+    p = argparse.ArgumentParser(description="Step 1 distillation CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     prep = sub.add_parser("prepare", help="Generate Gemini Batch JSONLs routed by Pro/Flash")
@@ -46,6 +47,17 @@ def _build_parser() -> argparse.ArgumentParser:
     val.add_argument("--out-dir", required=True)
     val.add_argument("--tokenizer-dir", default=None)
     val.add_argument("--max-tokens", type=int, default=4096)
+
+    ing = sub.add_parser(
+        "ingest",
+        help="Validate AGY OpenAI JSONLs (NativeTools + 85/15 thinking) and render Gemma 4 wire format",
+    )
+    ing.add_argument("--inputs", nargs="+", required=True)
+    ing.add_argument("--out-dir", required=True)
+    ing.add_argument("--tokenizer-dir", default=None)
+    ing.add_argument("--max-tokens", type=int, default=8192)
+    ing.add_argument("--max-thinking-ratio", type=float, default=0.20)
+    ing.add_argument("--strict", action="store_true")
     return p
 
 
@@ -94,6 +106,30 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "ingest":
+        tok = None
+        if args.tokenizer_dir:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(args.tokenizer_dir, use_fast=True)
+        out_dir = Path(args.out_dir)
+        report = convert_and_validate_openai_jsonl(
+            raw_jsonl_paths=args.inputs,
+            out_sft_path=out_dir / "sft_gemma4.jsonl",
+            out_orpo_path=out_dir / "orpo_gemma4.jsonl",
+            out_rejected_path=out_dir / "rejected.jsonl",
+            tokenizer=tok,
+            max_tokens=args.max_tokens,
+            max_thinking_ratio=args.max_thinking_ratio,
+        )
+        (out_dir / "distill_report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        if args.strict and (report["rejected_count"] > 0 or not report["thinking_ratio_ok"]):
+            return 1
         return 0
 
     return 1

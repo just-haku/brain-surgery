@@ -9,7 +9,10 @@
 brain/*.gguf
 
 # Large datasets, checkpoints, and scratch outputs
-data/
+data/*
+!data/distill/
+data/distill/*
+!data/distill/.gitkeep
 datasets/
 checkpoints/
 outputs/

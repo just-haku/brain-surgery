@@ -287,12 +287,13 @@ def render_gemma4_training_sample(
                 assistant_spans.append((span_start, pos))
                 span_start = None
         elif not (tr_out and not content_str and next_nt_role is None):
-            if span_start is None:
-                span_start = pos
-            emit(TURN_END)
-            assistant_spans.append((span_start, pos))
-            span_start = None
-            emit("\n")
+            if span_start is not None:
+                emit(TURN_END)
+                assistant_spans.append((span_start, pos))
+                span_start = None
+                emit("\n")
+            else:
+                emit(f"{TURN_END}\n")
         elif span_start is not None and pos > span_start:
             assistant_spans.append((span_start, pos))
 
@@ -319,10 +320,11 @@ def render_gemma4_orpo_pair(
     if not prompt_messages:
         raise ValueError("prompt_messages must not be empty")
 
+    sys_enable_thinking = bool(enable_thinking or _extract_thought(chosen))
     prompt_res = render_gemma4_training_sample(
         prompt_messages,
         tools=tools,
-        enable_thinking=enable_thinking,
+        enable_thinking=sys_enable_thinking,
         include_bos=include_bos,
         add_generation_prompt=False,
     )
@@ -335,10 +337,10 @@ def render_gemma4_orpo_pair(
     if last_raw != "tool" and not (last_non_tool and last_non_tool.get("role") in ("assistant", "model")):
         prompt_prefix += f"{TURN_START}model\n"
 
-    def _render_candidate(cand: dict[str, Any]) -> str:
+    def _render_candidate(cand: dict[str, Any], *, is_rejected: bool = False) -> str:
         parts: list[str] = []
         thought = _extract_thought(cand)
-        if enable_thinking and thought:
+        if thought and (sys_enable_thinking or is_rejected):
             parts.append(f"{THOUGHT_OPEN}{thought}\n{THOUGHT_CLOSE}")
         tool_calls = cand.get("tool_calls") or []
         for tc in tool_calls:
@@ -352,8 +354,8 @@ def render_gemma4_orpo_pair(
 
     return {
         "prompt": prompt_prefix,
-        "chosen": _render_candidate(chosen),
-        "rejected": _render_candidate(rejected),
+        "chosen": _render_candidate(chosen, is_rejected=False),
+        "rejected": _render_candidate(rejected, is_rejected=True),
     }
 
 
