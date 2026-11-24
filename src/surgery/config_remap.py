@@ -273,7 +273,7 @@ def remap_and_save_metadata(
 
     missing_processor_files = [
         fname
-        for fname in ("processor_config.json",)
+        for fname in ("processor_config.json", "chat_template.jinja")
         if not (dst / fname).exists()
     ]
 

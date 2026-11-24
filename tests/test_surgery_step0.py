@@ -201,6 +201,7 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
             (src / "tokenizer.json").write_text(json.dumps(tok_json), encoding="utf-8")
             (src / "tokenizer_config.json").write_text(json.dumps(tok_cfg), encoding="utf-8")
             (src / "processor_config.json").write_text("{\"processor_class\": \"Gemma4Processor\"}", encoding="utf-8")
+            (src / "chat_template.jinja").write_text("{{ bos_token }}", encoding="utf-8")
             (src / "tokenizer.model").write_bytes(b"fake-spm-protobuf")
 
             summary = inspect_checkpoint_metadata(src, verbose=False)
@@ -216,7 +217,9 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
             self.assertEqual(remap_report["tokenizer_model_action"], "removed_use_tokenizer_json_only")
             self.assertEqual(remap_report["missing_processor_files"], [])
             self.assertIn("processor_config.json", remap_report["copied_auxiliary_files"])
+            self.assertIn("chat_template.jinja", remap_report["copied_auxiliary_files"])
             self.assertTrue((dst / "processor_config.json").exists())
+            self.assertTrue((dst / "chat_template.jinja").exists())
             self.assertIn("[multimodal]", remap_report["injected_added_tokens"])
 
             new_tok_json = json.loads((dst / "tokenizer.json").read_text(encoding="utf-8"))
@@ -257,18 +260,22 @@ class TestConfigRemapAndPreflight(unittest.TestCase):
             target.mkdir()
 
             def fake_download(repo_id: str, filename: str, out_dir: Path, token: str | None) -> None:
-                if repo_id == "google/gemma-4-E2B-it":
+                if repo_id == "google/gemma-4-E4B-it":
                     raise PermissionError("401 gated repo")
-                if repo_id == "Austriani/Gemma-4-E2B-it-ARA-Abliterated" and filename == "processor_config.json":
+                if repo_id == "Austriani/Gemma-4-E4B-it-ARA-Abliterated" and filename in (
+                    "processor_config.json",
+                    "chat_template.jinja",
+                ):
                     (out_dir / filename).write_text("{}", encoding="utf-8")
 
             res = ensure_processor_configs(
                 target,
-                fallback_repos=("google/gemma-4-E2B-it", "Austriani/Gemma-4-E2B-it-ARA-Abliterated"),
+                fallback_repos=("google/gemma-4-E4B-it", "Austriani/Gemma-4-E4B-it-ARA-Abliterated"),
                 download_fn=fake_download,
             )
             self.assertEqual(res["missing_required"], [])
-            self.assertEqual(res["sources"]["processor_config.json"], "Austriani/Gemma-4-E2B-it-ARA-Abliterated")
+            self.assertEqual(res["sources"]["processor_config.json"], "Austriani/Gemma-4-E4B-it-ARA-Abliterated")
+            self.assertEqual(res["sources"]["chat_template.jinja"], "Austriani/Gemma-4-E4B-it-ARA-Abliterated")
 
 
 @unittest.skipUnless(GGUF_BASELINE.exists(), "Baseline GGUF not present in brain/")
@@ -316,16 +323,26 @@ class TestNotebookStructure(unittest.TestCase):
         code_cells = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
         full_text = "\n".join(code_cells)
 
-        # Preflight must precede shard slicing, and all 4 gates must be present.
+        self.assertIn("treadon/gemma4-E4B-it-abliterated", full_text)
+        self.assertIn("haku-nekooo/gemma4-e4b-nuclear-pruned", full_text)
+
+        # Preflight must precede shard slicing, and all 4 gates + E2E mtmd must follow in order.
         idx_preflight = full_text.index("inspect_checkpoint_metadata")
         idx_slice = full_text.index("slice_checkpoint_shards")
         idx_g1 = full_text.index("run_gate1_tokenizer")
         idx_g23 = full_text.index("run_gate2_and_gate3")
         idx_g4 = full_text.index("convert_hf_to_gguf.py")
+        idx_mtmd = full_text.index("test_code.png")
+        idx_upload = full_text.index("upload_folder")
         self.assertLess(idx_preflight, idx_slice)
         self.assertLess(idx_slice, idx_g1)
         self.assertLess(idx_g1, idx_g23)
         self.assertLess(idx_g23, idx_g4)
+        self.assertLess(idx_g4, idx_mtmd)
+        self.assertLess(idx_mtmd, idx_upload)
+        self.assertIn("llama-mtmd-cli", full_text)
+        self.assertIn("test_speech.wav", full_text)
+        self.assertIn("--jinja", full_text)
         self.assertNotIn("from_pretrained(\n    ORIG_DIR", full_text)
 
         # Parse every Python cell ignoring IPython shell/magic lines ('!' / '%').

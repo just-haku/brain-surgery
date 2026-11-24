@@ -12,6 +12,7 @@ from .vocab_filter import is_unused_token
 
 REQUIRED_PROCESSOR_FILES: tuple[str, ...] = (
     "processor_config.json",
+    "chat_template.jinja",
 )
 OPTIONAL_PROCESSOR_FILES: tuple[str, ...] = (
     "preprocessor_config.json",
@@ -20,9 +21,10 @@ OPTIONAL_PROCESSOR_FILES: tuple[str, ...] = (
     "audio_processor_config.json",
 )
 DEFAULT_PROCESSOR_FALLBACK_REPOS: tuple[str, ...] = (
+    "google/gemma-4-E4B-it",
     "google/gemma-4-E2B-it",
-    "Austriani/Gemma-4-E2B-it-ARA-Abliterated",
-    "unsloth/gemma-4-E2B-it",
+    "Austriani/Gemma-4-E4B-it-ARA-Abliterated",
+    "unsloth/gemma-4-E4B-it",
 )
 
 CRITICAL_SPECIAL_TOKENS: tuple[str, ...] = (

@@ -53,7 +53,11 @@ def _load_model_and_processor(model_dir: Path, torch_mod: Any):
         from transformers import AutoModelForCausalLM as ModelCls
 
     processor = AutoProcessor.from_pretrained(str(model_dir))
-    device_map = {"": 0} if torch_mod.cuda.is_available() else "cpu"
+    if torch_mod.cuda.is_available():
+        vram_gb = torch_mod.cuda.get_device_properties(0).total_memory / (1024**3)
+        device_map: dict[str, int] | str = {"": 0} if vram_gb >= 20.0 else "auto"
+    else:
+        device_map = "cpu"
     model = ModelCls.from_pretrained(
         str(model_dir),
         torch_dtype=torch_mod.bfloat16,
