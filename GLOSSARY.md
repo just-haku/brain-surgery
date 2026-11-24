@@ -35,3 +35,11 @@ _Avoid_: Custom XML thinking tags
 **ASCII Emoticon Policy**:
 Quy tắc loại bỏ hoàn toàn biểu tượng Unicode khỏi bộ từ điển và dữ liệu huấn luyện, chỉ cho phép biểu tượng mặt cười ASCII đơn giản như `:)`, `:)))`, `._.`, `.-.`, `=))` trong câu trò chuyện tự nhiên.
 _Avoid_: Emoji support, custom emoticon tokens
+
+**Agentic Trajectory**:
+Chuỗi hội thoại nhiều lượt mô phỏng đầy đủ vòng suy luận, gọi công cụ, nhận kết quả và phản hồi cuối cùng của trợ lý lập trình.
+_Avoid_: Single-turn prompt, chat log
+
+**Preference Pair**:
+Cặp mẫu đối chiếu gồm một phản hồi đạt chuẩn và một phản hồi mắc lỗi thực tế trên cùng ngữ cảnh, dùng để điều chỉnh hành vi mô hình tránh lặp lại sai sót.
+_Avoid_: Positive-only example, negative prompt

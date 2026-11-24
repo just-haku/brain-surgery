@@ -36,7 +36,10 @@ from surgery.vocab_filter import (  # noqa: E402
     select_hybrid_vocab,
 )
 
-GGUF_BASELINE = ROOT / "brain" / "Gemma-4-E2B-IT-AB.gguf"
+GGUF_BASELINE = next(
+    (p for p in sorted((ROOT / "brain").glob("*.gguf")) if "mmproj" not in p.name.lower()),
+    ROOT / "brain" / "gemma-4-E2B-it-Q4_K_M.gguf",
+)
 NOTEBOOK_PATH = ROOT / "notebooks" / "step0_vocab_pruning.ipynb"
 
 
