@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -61,8 +62,16 @@ class SFTConfig:
     warmup_ratio: float = 0.05
     eval_ratio: float = 0.05
     logging_steps: int = 10
-    save_steps: int = 200
+    save_steps: int = 50
     seed: int = 42
+
+
+def build_warmup_kwargs(cls: Any, warmup_ratio: float) -> dict[str, float]:
+    """Return warmup_ratio on Transformers 4.x or warmup_steps fraction on Transformers 5.x."""
+    params = inspect.signature(cls.__init__).parameters
+    if "warmup_ratio" in params:
+        return {"warmup_ratio": warmup_ratio}
+    return {"warmup_steps": warmup_ratio}
 
 
 def resolve_target_and_embed_modules(
@@ -154,7 +163,14 @@ def load_gemma4_for_training(model_dir: Path, *, use_4bit: bool = True) -> tuple
     model = ModelCls.from_pretrained(str(model_dir), **load_kwargs)
     model.config.use_cache = False
     if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+    if not use_4bit and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     return tok, model
 
 
@@ -256,7 +272,6 @@ def run_sft_training(cfg: SFTConfig) -> dict[str, Any]:
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         lr_scheduler_type="cosine",
-        warmup_ratio=cfg.warmup_ratio,
         bf16=True,
         logging_steps=cfg.logging_steps,
         save_steps=cfg.save_steps,
@@ -267,10 +282,16 @@ def run_sft_training(cfg: SFTConfig) -> dict[str, Any]:
         report_to="none",
         remove_unused_columns=False,
         seed=cfg.seed,
+        **build_warmup_kwargs(TrainingArguments, cfg.warmup_ratio),
     )
 
     param_groups = build_param_groups(model.named_parameters(), cfg)
-    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
+    try:
+        from bitsandbytes.optim import AdamW8bit
+
+        optimizer = AdamW8bit(param_groups, betas=(0.9, 0.999), eps=1e-8)
+    except ImportError:
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
 
     trainer = Trainer(
         model=model,

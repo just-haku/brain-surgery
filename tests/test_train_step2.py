@@ -34,10 +34,12 @@ from train.train_orpo import freeze_embeddings_and_ple  # noqa: E402
 from train.train_sft import (  # noqa: E402
     SFTConfig,
     build_param_groups,
+    build_warmup_kwargs,
     resolve_target_and_embed_modules,
 )
 
 STEP2_NOTEBOOK = ROOT / "notebooks" / "step2_train_qlora_orpo.ipynb"
+MODAL_SCRIPT = ROOT / "scripts" / "run_modal_step2.py"
 
 
 class _FakeParam:
@@ -338,6 +340,47 @@ class TestExportAndStep2Notebook(unittest.TestCase):
         self.assertIn("export_modular_gguf", full_src)
         for idx, src in enumerate(code_cells):
             ast.parse(src, filename=f"step2_cell_{idx}")
+
+    def test_warmup_kwargs_and_modal_step2_script(self) -> None:
+        class _V4Args:
+            def __init__(self, warmup_ratio: float = 0.0) -> None:
+                del warmup_ratio
+
+        class _V5Args:
+            def __init__(self, warmup_steps: float = 0.0) -> None:
+                del warmup_steps
+
+        self.assertEqual(build_warmup_kwargs(_V4Args, 0.05), {"warmup_ratio": 0.05})
+        self.assertEqual(build_warmup_kwargs(_V5Args, 0.05), {"warmup_steps": 0.05})
+
+        modal_src = MODAL_SCRIPT.read_text(encoding="utf-8")
+        tree = ast.parse(modal_src, filename=str(MODAL_SCRIPT))
+        for tok in (
+            "nuclear-distill-vol",
+            "huggingface-secret",
+            'gpu="A100"',
+            "timeout=7200",
+            "vol.commit()",
+            "haku-nekooo/gemma4-e4b-nuclear-pruned",
+            "haku-nekooo/gemma4-e4b-nuclear-agent",
+            "haku-nekooo/gemma4-e2b-nuclear-pruned",
+            "haku-nekooo/gemma4-e2b-nuclear-agent",
+            "IQ4_XS",
+            "q8_0",
+        ):
+            self.assertIn(tok, modal_src)
+
+        presets_val = next(
+            stmt.value
+            for stmt in tree.body
+            if isinstance(stmt, ast.AnnAssign)
+            and getattr(stmt.target, "id", None) == "VARIANT_PRESETS"
+        )
+        presets = ast.literal_eval(presets_val)
+        self.assertTrue(presets["e4b"]["train_embeddings"])
+        self.assertFalse(presets["e2b"]["train_embeddings"])
+        self.assertEqual(presets["e4b"]["learning_rate"], 1.5e-4)
+        self.assertEqual(presets["e2b"]["learning_rate"], 2.0e-4)
 
 
 if __name__ == "__main__":

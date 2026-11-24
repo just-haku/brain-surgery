@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .mm_integrity import (
 )
 from .train_sft import (
     SFTConfig,
+    build_warmup_kwargs,
     load_gemma4_for_training,
     merge_lora_to_bf16,
     resolve_target_and_embed_modules,
@@ -64,7 +66,11 @@ def run_orpo_training(cfg: ORPOConfig) -> dict[str, Any]:
     from datasets import Dataset
     from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
     import torch
-    from trl import ORPOConfig as TRLORPOConfig, ORPOTrainer
+
+    try:
+        from trl import ORPOConfig as TRLORPOConfig, ORPOTrainer
+    except ImportError:
+        from trl.experimental.orpo import ORPOConfig as TRLORPOConfig, ORPOTrainer
 
     if cfg.beta > 0.1:
         raise ValueError(f"ORPO beta={cfg.beta} exceeds safe ceiling 0.1 for vocab-pruned Gemma 4")
@@ -111,20 +117,25 @@ def run_orpo_training(cfg: ORPOConfig) -> dict[str, Any]:
         max_length=cfg.max_length,
         max_prompt_length=cfg.max_prompt_length,
         lr_scheduler_type="cosine",
-        warmup_ratio=cfg.warmup_ratio,
         bf16=True,
         logging_steps=cfg.logging_steps,
         save_strategy="epoch",
         dataset_num_proc=1,
         report_to="none",
         seed=cfg.seed,
+        **build_warmup_kwargs(TRLORPOConfig, cfg.warmup_ratio),
     )
 
+    trainer_tok_kw = (
+        {"processing_class": tok}
+        if "processing_class" in inspect.signature(ORPOTrainer.__init__).parameters
+        else {"tokenizer": tok}
+    )
     trainer = ORPOTrainer(
         model=model,
         args=trl_args,
         train_dataset=ds,
-        processing_class=tok,
+        **trainer_tok_kw,
     )
     train_result = trainer.train()
     model.save_pretrained(str(out_dir))
