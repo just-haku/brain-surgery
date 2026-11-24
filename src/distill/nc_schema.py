@@ -23,15 +23,16 @@ NC_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "description": "Search workspace text or symbols across files (case-insensitive UTF-8 scan).",
         "required": ("query",),
         "optional": ("ext", "max_hits"),
-        "types": {"query": str, "ext": str, "max_hits": int},
+        "tolerated_optional": ("path",),
+        "types": {"query": str, "ext": str, "max_hits": int, "path": str},
         "param_desc": {
             "query": "Exact text or identifier to search for.",
             "ext": "Optional file extension filter without dot, e.g. rs or py.",
             "max_hits": "Maximum number of search matches to return (>= 1, default 15, cap 100).",
         },
-        "non_empty": ("query",),
+        "non_empty": ("query", "path"),
         "positive_ints": ("max_hits",),
-        "forbidden": ("path", "symbol"),
+        "forbidden": ("symbol",),
     },
     "edit_file": {
         "description": (
@@ -208,7 +209,10 @@ def get_nc_openai_tools(
         spec = NC_TOOL_SPECS[name]
         props: dict[str, Any] = {}
         enums = spec.get("enum", {})
+        tolerated = set(spec.get("tolerated_optional", ()))
         for pname, ptype in spec["types"].items():
+            if pname in tolerated:
+                continue
             prop_schema: dict[str, Any] = {
                 "type": _JSON_TYPE_NAME[ptype],
                 "description": spec["param_desc"][pname],
@@ -341,7 +345,11 @@ def validate_tool_call(tool_name: str, args: dict[str, Any]) -> list[str]:
 
     errors: list[str] = []
     spec = NC_TOOL_SPECS[tool_name]
-    allowed = set(spec["required"]) | set(spec["optional"])
+    allowed = (
+        set(spec["required"])
+        | set(spec["optional"])
+        | set(spec.get("tolerated_optional", ()))
+    )
 
     for key in args:
         if key in spec["forbidden"] or key not in allowed:

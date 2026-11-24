@@ -1,4 +1,4 @@
-"""Modular GGUF exporter (Q4_K_M / IQ4_XS with optional imatrix + separate --mmproj)."""
+"""Modular GGUF exporter (IQ4_XS / Q4_K_M with --imatrix + bf16/q8_0 --mmproj)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ import sys
 from typing import Any
 
 FAT32_MAX_BYTES = 4_294_967_295
+DEFAULT_QUANTS: tuple[str, ...] = ("IQ4_XS", "Q4_K_M")
+DEFAULT_MMPROJ_OUTTYPES: tuple[str, ...] = ("bf16", "q8_0")
+DEFAULT_PLE_CPU_OFFLOAD = r'per_layer_token_embd\.weight=CPU'
 
 
 def _sha256_file(path: Path, chunk_bytes: int = 1 << 22) -> str:
@@ -27,23 +30,37 @@ def _sha256_file(path: Path, chunk_bytes: int = 1 << 22) -> str:
 def write_imatrix_calib_corpus(
     sft_jsonl: str | Path,
     out_txt: str | Path,
-    max_samples: int = 64,
+    max_samples: int = 128,
 ) -> Path:
-    """Write calibration text from compiled Gemma 4 SFT samples for llama-imatrix."""
+    """Sample evenly across compiled Gemma 4 SFT buckets to build an imatrix calibration file."""
     out = Path(out_txt)
     out.parent.mkdir(parents=True, exist_ok=True)
-    chunks: list[str] = []
+    texts: list[str] = []
     for raw in Path(sft_jsonl).read_text(encoding="utf-8").splitlines():
         if not raw.strip():
             continue
         row = json.loads(raw)
         txt = row.get("text")
         if isinstance(txt, str) and txt.strip():
-            chunks.append(txt.strip())
-        if len(chunks) >= max_samples:
-            break
-    out.write_text("\n\n".join(chunks) + "\n", encoding="utf-8")
+            texts.append(txt.strip())
+
+    if len(texts) > max_samples > 0:
+        step = len(texts) / max_samples
+        texts = [texts[int(i * step)] for i in range(max_samples)]
+
+    out.write_text("\n\n".join(texts) + "\n", encoding="utf-8")
     return out
+
+
+def _normalize_mmproj_types(
+    mmproj_outtypes: tuple[str, ...] | list[str] | None,
+    mmproj_outtype: str | None,
+) -> tuple[str, ...]:
+    if mmproj_outtype is not None:
+        return (mmproj_outtype.strip().lower(),)
+    if mmproj_outtypes is None:
+        return DEFAULT_MMPROJ_OUTTYPES
+    return tuple(str(t).strip().lower() for t in mmproj_outtypes if str(t).strip())
 
 
 def build_export_commands(
@@ -52,10 +69,11 @@ def build_export_commands(
     llama_cpp_dir: str | Path,
     *,
     model_prefix: str = "gemma4-e4b-nc",
-    quants: tuple[str, ...] | list[str] = ("Q4_K_M", "IQ4_XS"),
-    mmproj_outtype: str = "bf16",
+    quants: tuple[str, ...] | list[str] = DEFAULT_QUANTS,
+    mmproj_outtypes: tuple[str, ...] | list[str] | None = DEFAULT_MMPROJ_OUTTYPES,
+    mmproj_outtype: str | None = None,
     imatrix_calib_file: str | Path | None = None,
-    imatrix_chunks: int = 64,
+    imatrix_chunks: int = 128,
     python_exe: str | None = None,
 ) -> dict[str, list[str]]:
     """Build exact argv lists for convert_hf_to_gguf.py, llama-imatrix, and llama-quantize."""
@@ -70,7 +88,6 @@ def build_export_commands(
     imatrix_bin = bin_dir / "llama-imatrix"
 
     bf16_gguf = out / f"{model_prefix}-bf16.gguf"
-    mmproj_gguf = out / f"mmproj-{model_prefix}-{mmproj_outtype}.gguf"
     imatrix_path = out / f"{model_prefix}.imatrix"
 
     cmds: dict[str, list[str]] = {
@@ -83,7 +100,11 @@ def build_export_commands(
             "--outtype",
             "bf16",
         ],
-        "convert_mmproj": [
+    }
+
+    for mm_t in _normalize_mmproj_types(mmproj_outtypes, mmproj_outtype):
+        mmproj_gguf = out / f"mmproj-{model_prefix}-{mm_t}.gguf"
+        cmds[f"convert_mmproj_{mm_t}"] = [
             py,
             str(convert_py),
             str(model),
@@ -91,9 +112,8 @@ def build_export_commands(
             "--outfile",
             str(mmproj_gguf),
             "--outtype",
-            mmproj_outtype,
-        ],
-    }
+            mm_t,
+        ]
 
     use_imatrix = imatrix_calib_file is not None
     if use_imatrix:
@@ -127,22 +147,24 @@ def export_modular_gguf(
     llama_cpp_dir: str | Path,
     *,
     model_prefix: str = "gemma4-e4b-nc",
-    quants: tuple[str, ...] | list[str] = ("Q4_K_M", "IQ4_XS"),
-    mmproj_outtype: str = "bf16",
+    quants: tuple[str, ...] | list[str] = DEFAULT_QUANTS,
+    mmproj_outtypes: tuple[str, ...] | list[str] | None = DEFAULT_MMPROJ_OUTTYPES,
+    mmproj_outtype: str | None = None,
     imatrix_calib_file: str | Path | None = None,
-    imatrix_chunks: int = 64,
+    imatrix_chunks: int = 128,
     keep_bf16: bool = False,
 ) -> dict[str, Any]:
-    """Run BF16 GGUF conversion, --mmproj export, optional imatrix, and quantization."""
+    """Run BF16 GGUF conversion, bf16/q8_0 --mmproj export, optional imatrix, and quantization."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    eff_mm_types = _normalize_mmproj_types(mmproj_outtypes, mmproj_outtype)
     cmds = build_export_commands(
         model_dir,
         out,
         llama_cpp_dir,
         model_prefix=model_prefix,
         quants=quants,
-        mmproj_outtype=mmproj_outtype,
+        mmproj_outtypes=eff_mm_types,
         imatrix_calib_file=imatrix_calib_file,
         imatrix_chunks=imatrix_chunks,
     )
@@ -152,7 +174,6 @@ def export_modular_gguf(
         subprocess.run(cmd, check=True)
 
     bf16_path = Path(cmds["convert_text_bf16"][cmds["convert_text_bf16"].index("--outfile") + 1])
-    mmproj_path = Path(cmds["convert_mmproj"][cmds["convert_mmproj"].index("--outfile") + 1])
 
     artifacts: dict[str, Any] = {}
     for qtype in quants:
@@ -168,23 +189,37 @@ def export_modular_gguf(
             "sha256": _sha256_file(q_path),
         }
 
-    mm_bytes = mmproj_path.stat().st_size
-    artifacts["mmproj"] = {
-        "path": str(mmproj_path),
-        "bytes": mm_bytes,
-        "gb": round(mm_bytes / (1024**3), 3),
-        "outtype": mmproj_outtype,
-        "sha256": _sha256_file(mmproj_path),
-    }
+    for mm_t in eff_mm_types:
+        mm_cmd = cmds[f"convert_mmproj_{mm_t}"]
+        mmproj_path = Path(mm_cmd[mm_cmd.index("--outfile") + 1])
+        mm_bytes = mmproj_path.stat().st_size
+        artifacts[f"mmproj_{mm_t}"] = {
+            "path": str(mmproj_path),
+            "bytes": mm_bytes,
+            "gb": round(mm_bytes / (1024**3), 3),
+            "outtype": mm_t,
+            "sha256": _sha256_file(mmproj_path),
+        }
 
     if not keep_bf16 and bf16_path.exists():
         bf16_path.unlink()
+
+    pref_q = "IQ4_XS" if "IQ4_XS" in artifacts else next(iter(artifacts))
+    pref_mm = "mmproj_q8_0" if "mmproj_q8_0" in artifacts else f"mmproj_{eff_mm_types[0]}"
+    main_name = Path(artifacts[pref_q]["path"]).name
+    mm_name = Path(artifacts[pref_mm]["path"]).name
+    recommended_cmd = (
+        f'llama-server -m {main_name} --mmproj {mm_name} '
+        f'-ot "{DEFAULT_PLE_CPU_OFFLOAD}" -ngl 99 --jinja -c 16384 -ctk q8_0 -ctv q8_0 -fa on'
+    )
 
     manifest = {
         "model_dir": str(model_dir),
         "out_dir": str(out),
         "model_prefix": model_prefix,
         "imatrix_used": imatrix_calib_file is not None,
+        "ple_cpu_offload_flag": f'-ot "{DEFAULT_PLE_CPU_OFFLOAD}"',
+        "recommended_4gb_vram_cmd": recommended_cmd,
         "artifacts": artifacts,
     }
     (out / "export_manifest.json").write_text(
@@ -194,15 +229,16 @@ def export_modular_gguf(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Export modular text GGUF + --mmproj GGUF")
+    p = argparse.ArgumentParser(description="Export modular text GGUF + bf16/q8_0 --mmproj GGUF")
     p.add_argument("--model-dir", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--llama-cpp-dir", required=True)
     p.add_argument("--model-prefix", default="gemma4-e4b-nc")
-    p.add_argument("--quants", nargs="+", default=["Q4_K_M", "IQ4_XS"])
-    p.add_argument("--mmproj-outtype", default="bf16")
+    p.add_argument("--quants", nargs="+", default=list(DEFAULT_QUANTS))
+    p.add_argument("--mmproj-outtypes", nargs="+", default=list(DEFAULT_MMPROJ_OUTTYPES))
+    p.add_argument("--mmproj-outtype", default=None)
     p.add_argument("--imatrix-calib-file", default=None)
-    p.add_argument("--imatrix-chunks", type=int, default=64)
+    p.add_argument("--imatrix-chunks", type=int, default=128)
     p.add_argument("--keep-bf16", action="store_true")
     return p
 
@@ -215,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         ns.llama_cpp_dir,
         model_prefix=ns.model_prefix,
         quants=tuple(ns.quants),
+        mmproj_outtypes=tuple(ns.mmproj_outtypes),
         mmproj_outtype=ns.mmproj_outtype,
         imatrix_calib_file=ns.imatrix_calib_file,
         imatrix_chunks=ns.imatrix_chunks,

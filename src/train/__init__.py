@@ -1,5 +1,10 @@
 """Step 2 training, Vision/Audio SHA-256 integrity, and modular GGUF export for Gemma 4 E4B."""
 
+from .check_token_lengths import (
+    Gemma4BpeEncoder,
+    measure_dataset_token_lengths,
+    summarize_lengths,
+)
 from .dataset_loader import (
     build_assistant_loss_labels,
     load_jsonl,
@@ -8,6 +13,9 @@ from .dataset_loader import (
     split_train_eval,
 )
 from .export_gguf import (
+    DEFAULT_MMPROJ_OUTTYPES,
+    DEFAULT_PLE_CPU_OFFLOAD,
+    DEFAULT_QUANTS,
     FAT32_MAX_BYTES,
     build_export_commands,
     export_modular_gguf,
@@ -29,7 +37,11 @@ from .train_sft import (
 )
 
 __all__ = [
+    "DEFAULT_MMPROJ_OUTTYPES",
+    "DEFAULT_PLE_CPU_OFFLOAD",
+    "DEFAULT_QUANTS",
     "FAT32_MAX_BYTES",
+    "Gemma4BpeEncoder",
     "MULTIMODAL_KEYWORDS",
     "ORPOConfig",
     "SFTConfig",
@@ -44,10 +56,12 @@ __all__ = [
     "load_jsonl",
     "load_orpo_jsonl",
     "load_sft_jsonl",
+    "measure_dataset_token_lengths",
     "resolve_target_and_embed_modules",
     "run_orpo_training",
     "run_sft_training",
     "split_train_eval",
+    "summarize_lengths",
     "verify_multimodal_integrity",
     "write_imatrix_calib_corpus",
 ]

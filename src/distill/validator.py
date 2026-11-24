@@ -40,6 +40,8 @@ _RAW_JSON_LEAK_RE = re.compile(r'\{\s*"(?:thought|action|tool)"\s*:')
 _ROLE_LINE_RE = re.compile(r"\bRole:\s*(PLANNER|CODER|REVIEWER|EXPLORER)\b", re.IGNORECASE)
 
 VALID_MODES = frozenset({"nc_agent", "chat"})
+PER_STAGES = frozenset({"initial_plan", "micro_execute", "replan"})
+RECEIPT_FIELDS = ("STATUS:", "CHANGES:", "FILES:", "ISSUES:")
 VALID_ORPO_FAILURES = frozenset(
     {
         # Legacy Stage 2B failure buckets
@@ -54,6 +56,11 @@ VALID_ORPO_FAILURES = frozenset(
         "subagent_report_vs_nested_spawn",
         "stop_and_cite_vs_duplicate_or_nested_json",
         "ascii_vs_unicode_emoji",
+        # Wave 4 PER Loop preference buckets
+        "per_granular_plan_vs_monolithic",
+        "per_ledger_replan_vs_repeat_failed",
+        "per_compact_receipt_vs_verbose",
+        "per_worker_no_thinking_vs_thinking_on",
     }
 )
 
@@ -142,9 +149,12 @@ def _infer_role_and_worker(
     if messages and isinstance(messages[0], dict) and messages[0].get("role") in ("system", "developer"):
         sys_txt = str(messages[0].get("content") or "")
 
+    per_stage = sample.get("per_stage")
     role_val = sample.get("role")
     if role_val:
         role = str(role_val).lower()
+    elif per_stage in ("initial_plan", "replan"):
+        role = "planner"
     else:
         m = _ROLE_LINE_RE.search(sys_txt)
         if m:
@@ -156,10 +166,12 @@ def _infer_role_and_worker(
     is_worker = bool(
         depth_val >= 1
         or role == "explorer"
+        or sample.get("bucket") == "per_subagent_worker"
         or "depth=1" in sys_txt
         or "depth-1 worker" in sys_txt.lower()
         or (
-            role in ("coder", "reviewer")
+            per_stage is None
+            and role in ("coder", "reviewer")
             and "Role: CODER" in sys_txt
             and "spawn_subagent" not in sys_txt
         )
@@ -181,14 +193,64 @@ def _resolve_tools_for_sample(
     mode: str,
     role: str = "coder",
     is_worker: bool = False,
+    messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]] | None:
     if sample.get("tools"):
         return sample["tools"]
-    if role == "planner" or sample.get("grammar") == "planner":
+    if (
+        role == "planner"
+        or sample.get("grammar") == "planner"
+        or sample.get("per_stage") in ("initial_plan", "replan")
+    ):
         return None
     if mode == "nc_agent":
-        return get_nc_openai_tools(depth=1 if is_worker else 0)
+        sys_omits_spawn = bool(
+            messages
+            and isinstance(messages[0], dict)
+            and sample.get("per_stage") == "micro_execute"
+            and "spawn_subagent" not in str(messages[0].get("content") or "")
+        )
+        return get_nc_openai_tools(depth=1 if (is_worker or sys_omits_spawn) else 0)
     return None
+
+
+def _check_planner_tasks_detail(comp_text: str) -> list[str]:
+    errs: list[str] = []
+    try:
+        parsed = json.loads(comp_text)
+    except Exception:
+        return errs
+    if not isinstance(parsed, dict):
+        return ["planner content must be JSON object"]
+    if list(parsed.keys()) != ["goal", "decisions", "tasks"]:
+        errs.append(f"planner keys must be ['goal', 'decisions', 'tasks'], got {list(parsed.keys())}")
+    tasks = parsed.get("tasks")
+    if not isinstance(tasks, list) or not (1 <= len(tasks) <= 4):
+        return errs
+    for i, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            errs.append(f"tasks[{i}] must be object")
+            continue
+        if not str(task.get("id") or "").strip():
+            errs.append(f"tasks[{i}] missing non-empty 'id'")
+        if not str(task.get("title") or "").strip():
+            errs.append(f"tasks[{i}] missing non-empty 'title'")
+        tfiles = task.get("target_files")
+        if not isinstance(tfiles, list) or not all(isinstance(x, str) for x in tfiles):
+            errs.append(f"tasks[{i}].target_files must be list[str]")
+    return errs
+
+
+def _check_subtask_receipt_text(content: str) -> list[str]:
+    errs: list[str] = []
+    upper_lines = [ln.strip().upper() for ln in content.splitlines() if ln.strip()]
+    for prefix in RECEIPT_FIELDS:
+        if not any(ln.startswith(prefix) for ln in upper_lines):
+            errs.append(f"micro_execute SubTaskReceipt missing '{prefix}' line")
+    status_lines = [ln for ln in upper_lines if ln.startswith("STATUS:")]
+    if status_lines and not any(tok in status_lines[0] for tok in ("DONE", "BLOCKED")):
+        errs.append("SubTaskReceipt STATUS must be DONE or BLOCKED")
+    return errs
 
 
 def _check_native_initial_user(
@@ -328,6 +390,9 @@ def validate_sft_sample(
         return ["depth >= 1 worker/explorer/reviewer should keep thinking=False"]
 
     errors: list[str] = []
+    per_stage = sample.get("per_stage")
+    if per_stage is not None and per_stage not in PER_STAGES:
+        errors.append(f"unknown per_stage {per_stage!r}; expected one of {sorted(PER_STAGES)}")
     if mode == "nc_agent":
         errors.extend(_check_native_initial_user(messages, sample, "SFT"))
 
@@ -335,8 +400,14 @@ def validate_sft_sample(
         (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"),
         None,
     )
+    if per_stage == "replan" and first_user_idx is not None:
+        init_txt = str(messages[first_user_idx].get("content") or "")
+        if "## LEDGER" not in init_txt or "REPLAN" not in init_txt:
+            errors.append("per_stage 'replan' initial user prompt must include ## LEDGER and REPLAN")
+
     has_model_turn = False
     has_any_thought = False
+    assistant_turns = 0
     seen_read_sigs: list[tuple[str, str]] = []
 
     for idx, msg in enumerate(messages):
@@ -349,6 +420,7 @@ def validate_sft_sample(
             continue
         if m_role in ("model", "assistant"):
             has_model_turn = True
+            assistant_turns += 1
             thought_val = msg.get("reasoning_content") or msg.get("reasoning") or msg.get("thought") or ""
             if isinstance(thought_val, str) and thought_val.strip():
                 has_any_thought = True
@@ -380,6 +452,17 @@ def validate_sft_sample(
     if enable_thinking and not has_any_thought:
         errors.append("enable_thinking=True requires non-empty reasoning_content in at least one model turn")
 
+    if per_stage in ("initial_plan", "replan"):
+        errors.extend(_check_planner_tasks_detail(str(messages[-1].get("content") or "").strip()))
+    elif per_stage == "micro_execute":
+        if not (1 <= assistant_turns <= 5):
+            errors.append(f"per_stage 'micro_execute' has {assistant_turns} assistant turns (max 5)")
+        final_msg = messages[-1]
+        if isinstance(final_msg.get("content"), str) and not final_msg.get("tool_calls"):
+            errors.extend(_check_subtask_receipt_text(final_msg["content"]))
+        else:
+            errors.append("per_stage 'micro_execute' must end with plain-text SubTaskReceipt")
+
     total_est = sum(
         _est_tokens(m.get("content") or "") + _est_tokens(m.get("reasoning_content") or "")
         for m in messages
@@ -394,7 +477,9 @@ def validate_sft_sample(
     try:
         rendered = render_gemma4_training_sample(
             messages,
-            tools=_resolve_tools_for_sample(sample, mode=mode, role=role, is_worker=is_worker),
+            tools=_resolve_tools_for_sample(
+                sample, mode=mode, role=role, is_worker=is_worker, messages=messages
+            ),
             enable_thinking=enable_thinking,
         )
     except (ValueError, KeyError, TypeError) as exc:
@@ -476,6 +561,8 @@ def validate_orpo_pair(
         seen_read_sigs=prior_reads,
     )
     errors.extend(f"chosen: {e}" for e in chosen_errs)
+    if failure_type == "per_worker_no_thinking_vs_thinking_on" and chosen_thought:
+        errors.append("chosen: depth=1 worker must keep thinking=False / empty reasoning_content")
     if enable_thinking and not chosen_thought:
         errors.append("chosen: enable_thinking=True requires non-empty reasoning_content")
 
@@ -492,7 +579,9 @@ def validate_orpo_pair(
             prompt_msgs,
             chosen,
             rejected,
-            tools=_resolve_tools_for_sample(pair, mode=mode, role=role, is_worker=is_worker),
+            tools=_resolve_tools_for_sample(
+                pair, mode=mode, role=role, is_worker=is_worker, messages=prompt_msgs
+            ),
             enable_thinking=enable_thinking,
         )
     except (ValueError, KeyError, TypeError) as exc:
@@ -615,12 +704,15 @@ def convert_and_validate_openai_jsonl(
             sft_buckets[bucket] += 1
             rendered = render_gemma4_training_sample(
                 msgs,
-                tools=_resolve_tools_for_sample(sample, mode=mode, role=role, is_worker=is_worker),
+                tools=_resolve_tools_for_sample(
+                    sample, mode=mode, role=role, is_worker=is_worker, messages=msgs
+                ),
                 enable_thinking=thinking,
             )
             record = {
                 "id": sample.get("id"),
                 "bucket": bucket,
+                "per_stage": sample.get("per_stage"),
                 "mode": mode,
                 "role": role,
                 "thinking": thinking,
@@ -647,7 +739,9 @@ def convert_and_validate_openai_jsonl(
                 prompt_msgs,
                 pair["chosen"],
                 pair["rejected"],
-                tools=_resolve_tools_for_sample(pair, mode=mode, role=role, is_worker=is_worker),
+                tools=_resolve_tools_for_sample(
+                    pair, mode=mode, role=role, is_worker=is_worker, messages=prompt_msgs
+                ),
                 enable_thinking=thinking,
             )
             record = {

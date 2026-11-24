@@ -17,8 +17,13 @@ if str(SRC_DIR) not in sys.path:
 
 from distill.formatter import render_gemma4_training_sample  # noqa: E402
 from distill.nc_schema import get_nc_openai_tools  # noqa: E402
+from train.check_token_lengths import (  # noqa: E402
+    Gemma4BpeEncoder,
+    measure_dataset_token_lengths,
+    summarize_lengths,
+)
 from train.dataset_loader import build_assistant_loss_labels, split_train_eval  # noqa: E402
-from train.export_gguf import build_export_commands  # noqa: E402
+from train.export_gguf import DEFAULT_PLE_CPU_OFFLOAD, build_export_commands  # noqa: E402
 from train.mm_integrity import (  # noqa: E402
     freeze_multimodal_parameters,
     hash_multimodal_safetensors,
@@ -249,17 +254,70 @@ class TestDatasetMaskingAndTrainingConfig(unittest.TestCase):
 
 
 class TestExportAndStep2Notebook(unittest.TestCase):
+    def test_token_length_audit_bpe_and_summary(self) -> None:
+        self.assertTrue(summarize_lengths([10, 20, 30, 40], 40)["fits_100_pct"])
+        bad_sum = summarize_lengths([10, 50], 40)
+        self.assertEqual(bad_sum["exceeds_limit"], 1)
+        self.assertFalse(bad_sum["fits_100_pct"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            tok_json = {
+                "model": {
+                    "vocab": {
+                        "<pad>": 0,
+                        "<eos>": 1,
+                        "<bos>": 2,
+                        "<unk>": 3,
+                        "<|turn>": 4,
+                        "<turn|>": 5,
+                        "▁": 6,
+                        "h": 7,
+                        "i": 8,
+                        "hi": 9,
+                        "<0x0A>": 10,
+                    },
+                    "merges": [["h", "i"]],
+                },
+                "added_tokens": [
+                    {"id": 4, "content": "<|turn>", "special": True},
+                    {"id": 5, "content": "<turn|>", "special": True},
+                ],
+            }
+            tj_path = tmp_dir / "tokenizer.json"
+            tj_path.write_text(json.dumps(tok_json), encoding="utf-8")
+            enc = Gemma4BpeEncoder.from_tokenizer_json(tj_path)
+            ids = enc.encode("<|turn>hi<turn|>")
+            self.assertEqual(ids, [4, 9, 5])
+
+            sft_p = tmp_dir / "sft.jsonl"
+            orpo_p = tmp_dir / "orpo.jsonl"
+            sft_p.write_text(json.dumps({"text": "<|turn>hi<turn|>"}) + "\n", encoding="utf-8")
+            orpo_p.write_text(
+                json.dumps({"prompt": "<|turn>", "chosen": "hi", "rejected": "hi hi"}) + "\n",
+                encoding="utf-8",
+            )
+            rep = measure_dataset_token_lengths(sft_p, orpo_p, tokenizer_json=tj_path)
+            self.assertEqual(rep["unk_count"], 0)
+            self.assertEqual(rep["sft_text"]["max"], 3)
+            self.assertEqual(rep["orpo_rejected_total"]["max"], 4)
+
     def test_build_export_commands_and_notebook_ast(self) -> None:
         cmds = build_export_commands(
             model_dir="outputs/final_bf16",
             out_dir="outputs/gguf",
             llama_cpp_dir="/content/llama.cpp",
-            quants=("Q4_K_M", "IQ4_XS"),
+            quants=("IQ4_XS", "Q4_K_M"),
+            mmproj_outtypes=("bf16", "q8_0"),
             imatrix_calib_file="work/calib.txt",
             python_exe="python",
         )
-        self.assertIn("--mmproj", cmds["convert_mmproj"])
+        self.assertIn("--mmproj", cmds["convert_mmproj_bf16"])
+        self.assertIn("bf16", cmds["convert_mmproj_bf16"])
+        self.assertIn("--mmproj", cmds["convert_mmproj_q8_0"])
+        self.assertIn("q8_0", cmds["convert_mmproj_q8_0"])
         self.assertIn("imatrix", cmds)
+        self.assertIn("--imatrix", cmds["quantize_IQ4_XS"])
         self.assertIn("--imatrix", cmds["quantize_Q4_K_M"])
         self.assertEqual(cmds["quantize_IQ4_XS"][-1], "IQ4_XS")
 
@@ -268,6 +326,13 @@ class TestExportAndStep2Notebook(unittest.TestCase):
         code_cells = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
         full_src = "\n".join(code_cells)
         self.assertIn("haku-nekooo/gemma4-e4b-nuclear-pruned", full_src)
+        self.assertIn("haku-nekooo/gemma4-e4b-nuclear-agent", full_src)
+        self.assertIn("DATA_SOURCE_MODE", full_src)
+        self.assertIn("IQ4_XS", full_src)
+        self.assertIn("q8_0", full_src)
+        self.assertIn("per_layer_token_embd", DEFAULT_PLE_CPU_OFFLOAD)
+        self.assertIn("DEFAULT_PLE_CPU_OFFLOAD", full_src)
+        self.assertIn("measure_dataset_token_lengths", full_src)
         self.assertIn("run_sft_training", full_src)
         self.assertIn("run_orpo_training", full_src)
         self.assertIn("export_modular_gguf", full_src)

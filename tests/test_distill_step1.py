@@ -488,6 +488,78 @@ class TestValidatorPolicy(unittest.TestCase):
             self.assertNotIn("<|channel>thought", orpo_row["chosen"])
             self.assertIn("<|channel>thought", orpo_row["rejected"])
 
+    def test_wave4_per_loop_rules_and_search_text_path(self) -> None:
+        search_decl = next(t for t in get_nc_openai_tools() if t["function"]["name"] == "search_text")
+        self.assertNotIn("path", search_decl["function"]["parameters"]["properties"])
+        self.assertEqual(
+            validate_tool_call("search_text", {"query": "str_pool_len", "path": "crates/kval_bin/src"}),
+            [],
+        )
+
+        valid_micro = {
+            "id": "w4_micro_1",
+            "bucket": "per_micro_exec_sys",
+            "per_stage": "micro_execute",
+            "thinking": True,
+            "messages": [
+                {"role": "system", "content": build_nc_system_prompt("coder", depth=1)},
+                {"role": "user", "content": "## REPO_MAP\nsrc/lib.rs: foo@4 [30L]\n\n## TASK\nMicro-task T1: fix foo."},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Inspect foo before editing.",
+                    "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "search_text", "arguments": '{"query":"foo","path":"src"}'}}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "name": "search_text", "content": "No matches"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": None,
+                    "content": "STATUS: DONE\nCHANGES: Checked foo safely\nFILES: src/lib.rs\nISSUES: none",
+                },
+            ],
+        }
+        self.assertEqual(validate_sft_sample(valid_micro), [])
+
+        missing_receipt = {
+            **valid_micro,
+            "messages": [*valid_micro["messages"][:-1], {"role": "assistant", "reasoning_content": None, "content": "All done."}],
+        }
+        self.assertTrue(any("SubTaskReceipt" in e for e in validate_sft_sample(missing_receipt)))
+
+        bad_replan = {
+            "id": "w4_replan_bad",
+            "bucket": "per_replan",
+            "per_stage": "replan",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": build_nc_system_prompt("planner")},
+                {"role": "user", "content": "## REPO_MAP\nsrc/lib.rs: [10L]\n\n## TASK\nReplan"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": None,
+                    "content": json.dumps({"goal": "Fix", "decisions": [], "tasks": [{"id": "T1", "title": "Fix", "target_files": ["a.rs"]}]}),
+                },
+            ],
+        }
+        self.assertTrue(any("REPLAN" in e for e in validate_sft_sample(bad_replan)))
+
+        worker_think = {**valid_micro, "bucket": "per_subagent_worker", "thinking": True}
+        self.assertTrue(any("thinking=False" in e for e in validate_sft_sample(worker_think)))
+
+        per_orpo = {
+            "id": "w4_pref_worker",
+            "bucket": "per_worker_no_thinking_vs_thinking_on",
+            "prompt": [
+                {"role": "system", "content": build_nc_system_prompt("coder", depth=1)},
+                {"role": "user", "content": "## REPO_MAP\nsrc/a.rs: [10L]\n\n## TASK\nT1: check"},
+            ],
+            "chosen": {"role": "assistant", "content": "STATUS: DONE\nCHANGES: Checked\nFILES: src/a.rs\nISSUES: none", "reasoning_content": None},
+            "rejected": {"role": "assistant", "content": "STATUS: DONE\nCHANGES: Checked\nFILES: src/a.rs\nISSUES: none", "reasoning_content": "Long worker CoT."},
+        }
+        self.assertEqual(validate_orpo_pair(per_orpo), [])
+
 
 class TestPromptsBatchAndNotebook(unittest.TestCase):
     def test_routing_and_native_batch_parse_end_to_end(self) -> None:
