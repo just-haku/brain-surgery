@@ -408,6 +408,8 @@ class TestExportAndStep2Notebook(unittest.TestCase):
             "haku-nekooo/gemma4-e4b-nuclear-agent-v2",
             "haku-nekooo/gemma4-e2b-nuclear-pruned",
             "haku-nekooo/gemma4-e2b-nuclear-agent-v2",
+            "run_micro_orpo_pipeline",
+            "orpo_v2_1_patch.jsonl",
             "IQ4_XS",
             "q8_0",
         ):

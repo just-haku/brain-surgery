@@ -64,6 +64,11 @@ VALID_ORPO_FAILURES = frozenset(
         # Wave 5 v2 anti-loop & clean-code buckets
         "anti_loop_tool_termination",
         "clean_code_vs_syntax_hallucination",
+        # v2.1 Micro-ORPO refinement buckets
+        "on_policy_coding_patch",
+        "live_nc_step_efficiency",
+        "adapt_think_on_lead_concise",
+        "read_symbol_and_receipt_discipline",
     }
 )
 

@@ -161,6 +161,42 @@ def build_model_specs(brain_dir: Path | None = None) -> dict[str, ModelArtifactS
             reuse_paths={},
             modal_dir="/outputs/e2b_v2/gguf",
         ),
+        "e4b_nc_v2_1": ModelArtifactSpec(
+            key="e4b_nc_v2_1",
+            display_name="Gemma 4 E4B Nuclear Agent v2.1",
+            kind="nuclear_agent",
+            family="e4b",
+            hf_repo="haku-nekooo/gemma4-e4b-nuclear-agent-v2.1",
+            hf_subfolder="gguf",
+            mmproj_repo="haku-nekooo/gemma4-e4b-nuclear-agent-v2.1",
+            mmproj_subfolder="gguf",
+            quants={
+                "IQ4_XS": "gemma4-e4b-nc-IQ4_XS.gguf",
+                "Q4_K_M": "gemma4-e4b-nc-Q4_K_M.gguf",
+            },
+            mmproj_filename="mmproj-gemma4-e4b-nc-q8_0.gguf",
+            local_dir=bdir / "agents" / "e4b_v2_1",
+            reuse_paths={},
+            modal_dir="/outputs/e4b_v2_1/gguf",
+        ),
+        "e2b_nc_v2_1": ModelArtifactSpec(
+            key="e2b_nc_v2_1",
+            display_name="Gemma 4 E2B Nuclear Agent v2.1",
+            kind="nuclear_agent",
+            family="e2b",
+            hf_repo="haku-nekooo/gemma4-e2b-nuclear-agent-v2.1",
+            hf_subfolder="gguf",
+            mmproj_repo="haku-nekooo/gemma4-e2b-nuclear-agent-v2.1",
+            mmproj_subfolder="gguf",
+            quants={
+                "IQ4_XS": "gemma4-e2b-nc-IQ4_XS.gguf",
+                "Q4_K_M": "gemma4-e2b-nc-Q4_K_M.gguf",
+            },
+            mmproj_filename="mmproj-gemma4-e2b-nc-q8_0.gguf",
+            local_dir=bdir / "agents" / "e2b_v2_1",
+            reuse_paths={},
+            modal_dir="/outputs/e2b_v2_1/gguf",
+        ),
     }
 
 
@@ -244,12 +280,16 @@ def download_agent_artifacts(
         "e2b": "e2b_nc",
         "e4b_v2": "e4b_nc_v2",
         "e2b_v2": "e2b_nc_v2",
+        "e4b_v2_1": "e4b_nc_v2_1",
+        "e2b_v2_1": "e2b_nc_v2_1",
     }
-    norm = variant.strip().lower()
-    key = alias_map.get(norm, norm if norm.endswith("_nc_v2") else f"{norm}_nc")
+    norm = variant.strip().lower().replace(".", "_")
+    key = alias_map.get(norm, norm if "_nc_" in norm else f"{norm}_nc")
     specs = build_model_specs(brain_dir)
     if key not in specs:
-        raise ValueError(f"Unknown agent variant {variant!r}; expected e2b, e4b, e2b_v2, or e4b_v2")
+        raise ValueError(
+            f"Unknown agent variant {variant!r}; expected e2b, e4b, e2b_v2, e4b_v2, e2b_v2_1, or e4b_v2_1"
+        )
     spec = specs[key]
     out: dict[str, str] = {}
     targets = [(q, spec.quants[q], resolve_local_gguf_path(spec, q)) for q in quants]
@@ -471,9 +511,11 @@ def render_markdown_report(records: list[dict[str, Any]]) -> str:
         "e2b_inst": 0,
         "e2b_nc": 1,
         "e2b_nc_v2": 2,
-        "e4b_inst": 3,
-        "e4b_nc": 4,
-        "e4b_nc_v2": 5,
+        "e2b_nc_v2_1": 3,
+        "e4b_inst": 4,
+        "e4b_nc": 5,
+        "e4b_nc_v2": 6,
+        "e4b_nc_v2_1": 7,
     }
     q_order = {"IQ4_XS": 0, "Q4_K_M": 1}
     rows = sorted(

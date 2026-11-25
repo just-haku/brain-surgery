@@ -702,6 +702,16 @@ class TestValidatorPolicy(unittest.TestCase):
         }
         self.assertEqual(validate_orpo_pair(clean_code_orpo), [])
 
+        v21_coding_orpo = {
+            "id": "v21_code_1",
+            "bucket": "on_policy_coding_patch",
+            "tools": [],
+            "prompt": [{"role": "user", "content": "Implement dijkstra in Python."}],
+            "chosen": {"role": "assistant", "content": "```python\nimport heapq\n```", "reasoning_content": None},
+            "rejected": {"role": "assistant", "content": "```python\nimport heapqueue\n```", "reasoning_content": None},
+        }
+        self.assertEqual(validate_orpo_pair(v21_coding_orpo), [])
+
         rendered_no_tool = render_gemma4_training_sample(no_tool_regex["messages"], tools=None, enable_thinking=False)
         self.assertNotIn("<|tool>", rendered_no_tool["text"])
 

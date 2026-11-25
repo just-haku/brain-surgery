@@ -113,6 +113,109 @@ def _resolve_hf_token() -> str | None:
     return None
 
 
+def _ensure_hf_login(push_to_hf: bool) -> str | None:
+    from huggingface_hub import login
+
+    hf_token = _resolve_hf_token()
+    if push_to_hf and not hf_token:
+        raise RuntimeError(f"Missing HF_TOKEN inside Modal Secret '{HF_SECRET_NAME}'.")
+    if hf_token:
+        login(token=hf_token, add_to_git_credential=False)
+    return hf_token
+
+
+def _export_and_push_gguf(
+    *,
+    final_merged_dir: Path,
+    base_dir: Path,
+    out_root: Path,
+    calib_source_path: Path,
+    preset: dict[str, Any],
+    target_repo: str,
+    hf_token: str | None,
+    commit_tag: str,
+    run_export: bool,
+    push_to_hf: bool,
+) -> dict[str, Any]:
+    """Export quantized text + mmproj GGUFs, smoke-test llama-cli, and push to Hugging Face."""
+    from huggingface_hub import HfApi
+
+    from train.export_gguf import (
+        DEFAULT_PLE_CPU_OFFLOAD,
+        export_modular_gguf,
+        write_imatrix_calib_corpus,
+    )
+
+    out: dict[str, Any] = {}
+    gguf_dir = out_root / "gguf"
+    if run_export:
+        calib_txt = write_imatrix_calib_corpus(
+            calib_source_path, out_root / "imatrix_calib.txt", max_samples=128
+        )
+        export_manifest = export_modular_gguf(
+            model_dir=final_merged_dir,
+            out_dir=gguf_dir,
+            llama_cpp_dir=LLAMA_CPP_DIR,
+            model_prefix=preset["model_prefix"],
+            quants=("IQ4_XS", "Q4_K_M"),
+            mmproj_outtypes=("bf16", "q8_0"),
+            mmproj_model_dir=base_dir,
+            imatrix_calib_file=calib_txt,
+            imatrix_chunks=128,
+            imatrix_ngl=99,
+        )
+
+        cli_bin = f"{LLAMA_CPP_DIR}/build/bin/llama-cli"
+        cli_help = subprocess.run([cli_bin, "--help"], capture_output=True, text=True).stdout
+        cli_st = (
+            ["--single-turn"]
+            if "--single-turn" in cli_help
+            else (["-no-cnv"] if "-no-cnv" in cli_help else [])
+        )
+        iq4_path = export_manifest["artifacts"]["IQ4_XS"]["path"]
+        smoke = subprocess.run(
+            [
+                cli_bin,
+                "-m",
+                iq4_path,
+                "-ot",
+                DEFAULT_PLE_CPU_OFFLOAD,
+                "--jinja",
+                "-p",
+                "Viết 1 hàm Rust tính tổng i32:",
+                "-n",
+                "96",
+                "--no-display-prompt",
+                *cli_st,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        export_manifest["smoke_preview"] = smoke.stdout[:500]
+        out["export"] = export_manifest
+        vol.commit()
+
+    if push_to_hf and hf_token:
+        api = HfApi(token=hf_token)
+        api.create_repo(repo_id=target_repo, private=True, exist_ok=True)
+        api.upload_folder(
+            repo_id=target_repo,
+            folder_path=str(final_merged_dir),
+            commit_message=f"{commit_tag}: merged BF16 checkpoint",
+        )
+        if run_export and gguf_dir.exists():
+            api.upload_folder(
+                repo_id=target_repo,
+                folder_path=str(gguf_dir),
+                path_in_repo="gguf",
+                commit_message=f"{commit_tag}: IQ4_XS/Q4_K_M + bf16/q8_0 mmproj GGUFs",
+            )
+        out["hf_repo"] = f"https://huggingface.co/{target_repo}"
+    return out
+
+
 @app.function(
     image=image,
     gpu="A100",
@@ -131,28 +234,16 @@ def run_step2_pipeline(
     push_to_hf: bool = True,
 ) -> dict[str, Any]:
     """Execute SFT -> ORPO -> GGUF (IQ4_XS/Q4_K_M + bf16/q8_0 mmproj) -> HF upload on A100."""
-    from huggingface_hub import HfApi, login, snapshot_download
+    from huggingface_hub import snapshot_download
     from transformers import AutoTokenizer
 
     from train.check_token_lengths import measure_dataset_token_lengths
-    from train.export_gguf import (
-        DEFAULT_PLE_CPU_OFFLOAD,
-        export_modular_gguf,
-        write_imatrix_calib_corpus,
-    )
     from train.train_orpo import ORPOConfig, run_orpo_training
     from train.train_sft import SFTConfig, run_sft_training
 
     preset = resolve_variant_preset(variant)
     vol.reload()
-
-    hf_token = _resolve_hf_token()
-    if push_to_hf and not hf_token:
-        raise RuntimeError(
-            f"Missing HF_TOKEN inside Modal Secret '{HF_SECRET_NAME}'."
-        )
-    if hf_token:
-        login(token=hf_token, add_to_git_credential=False)
+    hf_token = _ensure_hf_login(push_to_hf)
 
     sft_path = Path(VOLUME_MOUNT) / "distill" / "sft_gemma4.jsonl"
     orpo_path = Path(VOLUME_MOUNT) / "distill" / "orpo_gemma4.jsonl"
@@ -190,7 +281,6 @@ def run_step2_pipeline(
     sft_merged_dir = out_root / "stage2a_sft_merged"
     orpo_lora_dir = out_root / "stage2b_orpo_lora"
     orpo_merged_dir = out_root / "stage2b_orpo_merged"
-    gguf_dir = out_root / "gguf"
 
     summary: dict[str, Any] = {
         "variant": variant.lower(),
@@ -235,74 +325,137 @@ def run_step2_pipeline(
         final_merged_dir = orpo_merged_dir
 
     print(f"[run_modal_step2] Final merged checkpoint: {final_merged_dir}", flush=True)
-
-    if run_export:
-        calib_txt = write_imatrix_calib_corpus(
-            sft_path, out_root / "imatrix_calib.txt", max_samples=128
+    summary.update(
+        _export_and_push_gguf(
+            final_merged_dir=final_merged_dir,
+            base_dir=base_dir,
+            out_root=out_root,
+            calib_source_path=sft_path,
+            preset=preset,
+            target_repo=preset["target_repo"],
+            hf_token=hf_token,
+            commit_tag=f"Modal A100 Step 2 ({variant})",
+            run_export=run_export,
+            push_to_hf=push_to_hf,
         )
-        export_manifest = export_modular_gguf(
-            model_dir=final_merged_dir,
-            out_dir=gguf_dir,
-            llama_cpp_dir=LLAMA_CPP_DIR,
-            model_prefix=preset["model_prefix"],
-            quants=("IQ4_XS", "Q4_K_M"),
-            mmproj_outtypes=("bf16", "q8_0"),
-            mmproj_model_dir=base_dir,
-            imatrix_calib_file=calib_txt,
-            imatrix_chunks=128,
-            imatrix_ngl=99,
-        )
-
-        cli_bin = f"{LLAMA_CPP_DIR}/build/bin/llama-cli"
-        cli_help = subprocess.run([cli_bin, "--help"], capture_output=True, text=True).stdout
-        cli_st = (
-            ["--single-turn"]
-            if "--single-turn" in cli_help
-            else (["-no-cnv"] if "-no-cnv" in cli_help else [])
-        )
-        iq4_path = export_manifest["artifacts"]["IQ4_XS"]["path"]
-        smoke = subprocess.run(
-            [
-                cli_bin,
-                "-m",
-                iq4_path,
-                "-ot",
-                DEFAULT_PLE_CPU_OFFLOAD,
-                "--jinja",
-                "-p",
-                "Viết 1 hàm Rust tính tổng i32:",
-                "-n",
-                "96",
-                "--no-display-prompt",
-                *cli_st,
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        export_manifest["smoke_preview"] = smoke.stdout[:500]
-        summary["export"] = export_manifest
-        vol.commit()
-
-    if push_to_hf:
-        api = HfApi(token=hf_token)
-        api.create_repo(repo_id=preset["target_repo"], private=True, exist_ok=True)
-        api.upload_folder(
-            repo_id=preset["target_repo"],
-            folder_path=str(final_merged_dir),
-            commit_message=f"Modal A100 Step 2 ({variant}): merged BF16 checkpoint",
-        )
-        if run_export and gguf_dir.exists():
-            api.upload_folder(
-                repo_id=preset["target_repo"],
-                folder_path=str(gguf_dir),
-                path_in_repo="gguf",
-                commit_message=f"Modal A100 Step 2 ({variant}): IQ4_XS/Q4_K_M + bf16/q8_0 mmproj GGUFs",
-            )
-        summary["hf_repo"] = f"https://huggingface.co/{preset['target_repo']}"
+    )
 
     (out_root / "step2_modal_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    vol.commit()
+    return summary
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    cpu=8,
+    memory=32768,
+    timeout=7200,
+    volumes={VOLUME_MOUNT: vol},
+    secrets=[hf_secret],
+)
+def run_micro_orpo_pipeline(
+    variant: str = "e4b",
+    orpo_relpath: str = "distill/orpo_v2_1_patch.jsonl",
+    learning_rate: float = 5e-6,
+    beta: float = 0.1,
+    num_train_epochs: float = 1.0,
+    run_export: bool = True,
+    push_to_hf: bool = True,
+) -> dict[str, Any]:
+    """Run v2.1 1-epoch Micro-ORPO from v2 stage2b_orpo_merged (embeddings & MM frozen)."""
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
+
+    from train.check_token_lengths import measure_dataset_token_lengths
+    from train.train_orpo import ORPOConfig, run_orpo_training
+
+    norm_var = variant.strip().lower()
+    preset = resolve_variant_preset(norm_var)
+    vol.reload()
+    hf_token = _ensure_hf_login(push_to_hf)
+
+    source_merged_dir = Path(VOLUME_MOUNT) / "outputs" / f"{norm_var}_v2" / "stage2b_orpo_merged"
+    if not (source_merged_dir / "config.json").exists():
+        raise FileNotFoundError(
+            f"Missing v2 ORPO-merged checkpoint on Modal Volume: {source_merged_dir}"
+        )
+
+    orpo_path = Path(VOLUME_MOUNT) / orpo_relpath
+    if not orpo_path.is_file():
+        raise FileNotFoundError(f"Missing Micro-ORPO dataset on Modal Volume: {orpo_path}")
+
+    calib_source = Path(VOLUME_MOUNT) / "distill" / "sft_gemma4.jsonl"
+    if not calib_source.is_file():
+        calib_source = orpo_path
+
+    base_dir = Path(VOLUME_MOUNT) / "cache" / norm_var / "base_ckpt"
+    if not (base_dir / "config.json").exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(repo_id=preset["base_repo"], local_dir=str(base_dir), token=hf_token)
+        vol.commit()
+
+    tok = AutoTokenizer.from_pretrained(str(base_dir), use_fast=True)
+    tok_report = measure_dataset_token_lengths(
+        calib_source,
+        orpo_path,
+        tokenizer=tok,
+        sft_limit=8192,
+        orpo_limit=4096,
+        orpo_prompt_limit=2560,
+    )
+    print("Micro-ORPO token length check:", json.dumps(tok_report, indent=2))
+    assert tok_report["unk_count"] == 0, f"Found {tok_report['unk_count']} <unk> tokens"
+    assert tok_report["orpo_chosen_total"]["exceeds_limit"] == 0
+    assert tok_report["orpo_rejected_total"]["exceeds_limit"] == 0
+
+    out_root = Path(VOLUME_MOUNT) / "outputs" / f"{norm_var}_v2_1"
+    out_root.mkdir(parents=True, exist_ok=True)
+    orpo_lora_dir = out_root / "stage2b_micro_orpo_lora"
+    orpo_merged_dir = out_root / "stage2b_micro_orpo_merged"
+    target_repo = f"haku-nekooo/gemma4-{norm_var}-nuclear-agent-v2.1"
+
+    orpo_cfg = ORPOConfig(
+        sft_merged_dir=str(source_merged_dir),
+        orpo_jsonl=str(orpo_path),
+        output_dir=str(orpo_lora_dir),
+        merged_dir=str(orpo_merged_dir),
+        max_length=4096,
+        max_prompt_length=2560,
+        use_4bit=False,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.0,
+        beta=beta,
+        learning_rate=learning_rate,
+        num_train_epochs=num_train_epochs,
+    )
+    summary: dict[str, Any] = {
+        "variant": norm_var,
+        "source_merged_dir": str(source_merged_dir),
+        "target_repo": target_repo,
+        "token_lengths": tok_report,
+        "micro_orpo": run_orpo_training(orpo_cfg),
+    }
+    vol.commit()
+
+    summary.update(
+        _export_and_push_gguf(
+            final_merged_dir=orpo_merged_dir,
+            base_dir=base_dir,
+            out_root=out_root,
+            calib_source_path=calib_source,
+            preset=preset,
+            target_repo=target_repo,
+            hf_token=hf_token,
+            commit_tag=f"Modal A100 Micro-ORPO v2.1 ({norm_var})",
+            run_export=run_export,
+            push_to_hf=push_to_hf,
+        )
+    )
+    (out_root / "micro_orpo_modal_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     vol.commit()
@@ -317,20 +470,38 @@ def main(
     skip_orpo: bool = False,
     skip_export: bool = False,
     no_push: bool = False,
+    micro_orpo: bool = False,
+    orpo_relpath: str = "distill/orpo_v2_1_patch.jsonl",
+    orpo_lr: float = 5e-6,
 ) -> None:
-    """Launch Step 2 training + GGUF export on Modal A100."""
+    """Launch Step 2 training or v2.1 Micro-ORPO + GGUF export on Modal A100."""
     preset = resolve_variant_preset(variant)
-    print(
-        f"Launching Modal Step 2 ({variant}) on A100: "
-        f"{preset['base_repo']} -> {preset['target_repo']} "
-        f"(lr={preset['learning_rate']}, train_embeddings={preset['train_embeddings']}, use_4bit={use_4bit})"
-    )
-    result = run_step2_pipeline.remote(
-        variant=variant,
-        use_4bit=use_4bit,
-        run_sft=not skip_sft,
-        run_orpo=not skip_orpo,
-        run_export=not skip_export,
-        push_to_hf=not no_push,
-    )
+    if micro_orpo:
+        norm_var = variant.strip().lower()
+        print(
+            f"Launching Modal Micro-ORPO v2.1 ({norm_var}) on A100: "
+            f"/vol/outputs/{norm_var}_v2/stage2b_orpo_merged -> haku-nekooo/gemma4-{norm_var}-nuclear-agent-v2.1 "
+            f"(lr={orpo_lr}, beta=0.1, epochs=1.0)"
+        )
+        result = run_micro_orpo_pipeline.remote(
+            variant=norm_var,
+            orpo_relpath=orpo_relpath,
+            learning_rate=orpo_lr,
+            run_export=not skip_export,
+            push_to_hf=not no_push,
+        )
+    else:
+        print(
+            f"Launching Modal Step 2 ({variant}) on A100: "
+            f"{preset['base_repo']} -> {preset['target_repo']} "
+            f"(lr={preset['learning_rate']}, train_embeddings={preset['train_embeddings']}, use_4bit={use_4bit})"
+        )
+        result = run_step2_pipeline.remote(
+            variant=variant,
+            use_4bit=use_4bit,
+            run_sft=not skip_sft,
+            run_orpo=not skip_orpo,
+            run_export=not skip_export,
+            push_to_hf=not no_push,
+        )
     print(json.dumps(result, indent=2, ensure_ascii=False))
