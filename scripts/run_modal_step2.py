@@ -27,7 +27,8 @@ HF_SECRET_NAME = os.environ.get("MODAL_HF_SECRET_NAME", "huggingface-secret")
 VARIANT_PRESETS: dict[str, dict[str, Any]] = {
     "e4b": {
         "base_repo": "haku-nekooo/gemma4-e4b-nuclear-pruned",
-        "target_repo": "haku-nekooo/gemma4-e4b-nuclear-agent",
+        "target_repo": "haku-nekooo/gemma4-e4b-nuclear-agent-v2",
+        "output_subdir": "e4b_v2",
         "learning_rate": 1.5e-4,
         "embedding_lr": 1.5e-5,
         "train_embeddings": True,
@@ -35,7 +36,8 @@ VARIANT_PRESETS: dict[str, dict[str, Any]] = {
     },
     "e2b": {
         "base_repo": "haku-nekooo/gemma4-e2b-nuclear-pruned",
-        "target_repo": "haku-nekooo/gemma4-e2b-nuclear-agent",
+        "target_repo": "haku-nekooo/gemma4-e2b-nuclear-agent-v2",
+        "output_subdir": "e2b_v2",
         "learning_rate": 2.0e-4,
         "embedding_lr": 2.0e-5,
         "train_embeddings": False,
@@ -159,7 +161,7 @@ def run_step2_pipeline(
             f"Dataset missing in Modal Volume '{VOLUME_NAME}': {sft_path} / {orpo_path}"
         )
 
-    out_root = Path(VOLUME_MOUNT) / "outputs" / variant.lower()
+    out_root = Path(VOLUME_MOUNT) / "outputs" / preset.get("output_subdir", variant.lower())
     base_dir = Path(VOLUME_MOUNT) / "cache" / variant.lower() / "base_ckpt"
     out_root.mkdir(parents=True, exist_ok=True)
     base_dir.mkdir(parents=True, exist_ok=True)

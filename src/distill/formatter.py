@@ -206,7 +206,7 @@ def render_gemma4_training_sample(
         raise ValueError("conversation must include at least one user/model turn")
 
     assistant_spans: list[tuple[int, int]] = []
-    prev_non_tool_role: str | None = None
+    model_turn_open = False
     prev_message_type: str | None = None
 
     for idx, msg in enumerate(loop_messages):
@@ -219,16 +219,18 @@ def render_gemma4_training_sample(
         if role not in ("user", "model"):
             raise ValueError(f"Unsupported role in training sample: {raw_role!r}")
 
-        continue_same_model_turn = role == "model" and prev_non_tool_role in ("assistant", "model")
-        if not continue_same_model_turn:
-            emit(f"{TURN_START}{role}\n")
-
         if role == "user":
-            emit(f"{str(msg.get('content', '')).strip()}{TURN_END}\n")
-            prev_non_tool_role = raw_role
+            if model_turn_open:
+                emit(f"{TURN_END}\n")
+                model_turn_open = False
+            emit(f"{TURN_START}user\n{str(msg.get('content', '')).strip()}{TURN_END}\n")
             continue
 
         # Model/assistant turn: collect model-generated span separately from <|tool_response>.
+        if not model_turn_open:
+            emit(f"{TURN_START}model\n")
+            model_turn_open = True
+
         span_start: int | None = pos
 
         thought = _extract_thought(msg)
@@ -239,16 +241,23 @@ def render_gemma4_training_sample(
         if tool_calls:
             for tc in tool_calls:
                 emit(format_gemma4_tool_call(tc))
+            # Close tool-calling model turn with <turn|> inside supervised span so model learns EOS after tool calls.
+            emit(TURN_END)
+            if span_start is not None and pos > span_start:
+                assistant_spans.append((span_start, pos))
+                span_start = None
+            emit("\n")
+            model_turn_open = False
             prev_message_type = "tool_call"
 
-        # Fold following consecutive role:tool messages (exactly as Jinja template does).
+        # Fold following consecutive role:tool messages (opening an unsupervised model continuation turn).
         tr_out = False
         if tool_calls:
             k = idx + 1
             while k < len(loop_messages) and loop_messages[k].get("role") == "tool":
-                if span_start is not None and pos > span_start:
-                    assistant_spans.append((span_start, pos))
-                    span_start = None
+                if not model_turn_open:
+                    emit(f"{TURN_START}model\n")
+                    model_turn_open = True
                 follow = loop_messages[k]
                 tname = str(follow.get("name") or "unknown")
                 for tc in tool_calls:
@@ -262,6 +271,9 @@ def render_gemma4_training_sample(
 
         content_str = str(msg.get("content") or "").strip()
         if content_str:
+            if not model_turn_open:
+                emit(f"{TURN_START}model\n")
+                model_turn_open = True
             if span_start is None:
                 span_start = pos
             emit(content_str)
@@ -273,34 +285,26 @@ def render_gemma4_training_sample(
                 next_nt_role = loop_messages[j].get("role")
                 break
 
-        continues_into_next = (
-            next_nt_role in ("assistant", "model") and (not tool_calls or tr_out)
-        )
-
-        if prev_message_type == "tool_call" and not tr_out:
-            if span_start is not None and pos > span_start:
+        if model_turn_open:
+            continues_into_next = next_nt_role in ("assistant", "model")
+            if continues_into_next:
+                if span_start is not None and pos > span_start:
+                    assistant_spans.append((span_start, pos))
+                    span_start = None
+            elif not (tr_out and not content_str and next_nt_role is None):
+                if span_start is not None:
+                    emit(TURN_END)
+                    assistant_spans.append((span_start, pos))
+                    span_start = None
+                    emit("\n")
+                else:
+                    emit(f"{TURN_END}\n")
+                model_turn_open = False
+            elif span_start is not None and pos > span_start:
                 assistant_spans.append((span_start, pos))
-                span_start = None
-            emit(TOOL_RESP_OPEN)
-        elif continues_into_next:
-            if span_start is not None and pos > span_start:
-                assistant_spans.append((span_start, pos))
-                span_start = None
-        elif not (tr_out and not content_str and next_nt_role is None):
-            if span_start is not None:
-                emit(TURN_END)
-                assistant_spans.append((span_start, pos))
-                span_start = None
-                emit("\n")
-            else:
-                emit(f"{TURN_END}\n")
-        elif span_start is not None and pos > span_start:
-            assistant_spans.append((span_start, pos))
-
-        prev_non_tool_role = raw_role
 
     if add_generation_prompt:
-        if prev_message_type not in ("tool_response", "tool_call"):
+        if not model_turn_open:
             emit(f"{TURN_START}model\n")
         elif prev_message_type == "tool_response" and enable_thinking:
             emit(THOUGHT_OPEN)
@@ -329,12 +333,7 @@ def render_gemma4_orpo_pair(
         add_generation_prompt=False,
     )
     prompt_prefix = prompt_res["text"]
-    last_non_tool = next(
-        (m for m in reversed(prompt_messages) if m.get("role") != "tool"),
-        None,
-    )
-    last_raw = prompt_messages[-1].get("role")
-    if last_raw != "tool" and not (last_non_tool and last_non_tool.get("role") in ("assistant", "model")):
+    if not prompt_prefix.endswith(TOOL_RESP_CLOSE) and not prompt_prefix.endswith(f"{TURN_START}model\n"):
         prompt_prefix += f"{TURN_START}model\n"
 
     def _render_candidate(cand: dict[str, Any], *, is_rejected: bool = False) -> str:
@@ -348,8 +347,7 @@ def render_gemma4_orpo_pair(
         body = str(cand.get("content") or "").strip()
         if body:
             parts.append(body)
-        if not tool_calls:
-            parts.append(TURN_END + "\n")
+        parts.append(TURN_END + "\n")
         return "".join(parts)
 
     return {

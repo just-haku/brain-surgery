@@ -32,14 +32,14 @@ MUTATING_TOOLS = frozenset(
 )
 
 _ASCII_EMOTICON_RE = re.compile(
-    r"(?:(?<![A-Za-z0-9_:/=])(?::\)+|:\(+|:D+|;+\)+|:P\b)|(?<![A-Za-z0-9_])(?:=+\)+|\._\.|\.\-\.|\^_\^))(?=$|[\s,.!?;'\"\]}])"
+    r"(?:(?<![A-Za-z0-9_:/=])(?::\)+|:\(+|:D+|;+\)+|:P\b)|(?<![A-Za-z0-9_|(<>=!+-])(?:=+\)+(?![?])|\._\.|\.\-\.|\^_\^))(?=$|[\s,.!?;'\"\]}])"
 )
 _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 _RAW_JSON_LEAK_RE = re.compile(r'\{\s*"(?:thought|action|tool)"\s*:')
 _ROLE_LINE_RE = re.compile(r"\bRole:\s*(PLANNER|CODER|REVIEWER|EXPLORER)\b", re.IGNORECASE)
 
-VALID_MODES = frozenset({"nc_agent", "chat"})
+VALID_MODES = frozenset({"nc_agent", "chat", "no_tool"})
 PER_STAGES = frozenset({"initial_plan", "micro_execute", "replan"})
 RECEIPT_FIELDS = ("STATUS:", "CHANGES:", "FILES:", "ISSUES:")
 VALID_ORPO_FAILURES = frozenset(
@@ -61,6 +61,9 @@ VALID_ORPO_FAILURES = frozenset(
         "per_ledger_replan_vs_repeat_failed",
         "per_compact_receipt_vs_verbose",
         "per_worker_no_thinking_vs_thinking_on",
+        # Wave 5 v2 anti-loop & clean-code buckets
+        "anti_loop_tool_termination",
+        "clean_code_vs_syntax_hallucination",
     }
 )
 
@@ -87,13 +90,30 @@ def extract_code_blocks_and_prose(text: str) -> tuple[list[str], str]:
     return code_blocks, prose_only
 
 
-def has_repetition_loop(text: str, ngram_size: int = 8, max_repeats: int = 3) -> bool:
+def has_repetition_loop(
+    text: str,
+    ngram_size: int = 8,
+    max_repeats: int = 3,
+    *,
+    consecutive_lines_only: bool = False,
+) -> bool:
     """Detect repetitive word n-grams or consecutive duplicate lines typical of 2B/4B loops."""
-    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 12]
-    if lines:
-        line_counts = Counter(lines)
-        if max(line_counts.values()) >= max_repeats + 1:
-            return True
+    if consecutive_lines_only:
+        raw_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        run = 1
+        for prev_ln, cur_ln in zip(raw_lines, raw_lines[1:]):
+            if len(cur_ln) >= 12 and cur_ln == prev_ln:
+                run += 1
+                if run >= max_repeats + 1:
+                    return True
+            else:
+                run = 1
+    else:
+        lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 12]
+        if lines:
+            line_counts = Counter(lines)
+            if max(line_counts.values()) >= max_repeats + 1:
+                return True
 
     words = text.split()
     if len(words) < ngram_size * max_repeats:
@@ -129,6 +149,11 @@ def _infer_mode(sample: dict[str, Any], messages: list[dict[str, Any]]) -> str:
     explicit = sample.get("mode")
     if explicit is not None:
         return str(explicit)
+    if "tools" in sample and isinstance(sample["tools"], list) and len(sample["tools"]) == 0:
+        return "no_tool"
+    chosen = sample.get("chosen")
+    if isinstance(chosen, dict) and chosen.get("tool_calls"):
+        return "nc_agent"
     for m in messages:
         if not isinstance(m, dict):
             continue
@@ -145,6 +170,9 @@ def _infer_role_and_worker(
     messages: list[dict[str, Any]],
     mode: str,
 ) -> tuple[str, bool]:
+    if mode in ("no_tool", "chat"):
+        return ("chat" if mode == "chat" else "no_tool", False)
+
     sys_txt = ""
     if messages and isinstance(messages[0], dict) and messages[0].get("role") in ("system", "developer"):
         sys_txt = str(messages[0].get("content") or "")
@@ -195,6 +223,10 @@ def _resolve_tools_for_sample(
     is_worker: bool = False,
     messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]] | None:
+    if "tools" in sample and isinstance(sample["tools"], list) and len(sample["tools"]) == 0:
+        return None
+    if mode in ("no_tool", "chat"):
+        return None
     if sample.get("tools"):
         return sample["tools"]
     if (
@@ -337,9 +369,14 @@ def _validate_model_turn(
                     seen_read_sigs.append(sig)
 
     if content.strip():
-        if has_repetition_loop(content):
-            errors.append("repetition loop detected inside model content")
         code_blocks, prose_only = extract_code_blocks_and_prose(content)
+        if has_repetition_loop(prose_only) or any(
+            has_repetition_loop(
+                blk, ngram_size=12, max_repeats=6, consecutive_lines_only=True
+            )
+            for blk in code_blocks
+        ):
+            errors.append("repetition loop detected inside model content")
         for blk in code_blocks:
             if contains_ascii_emoticon(blk):
                 errors.append("ASCII emoticon forbidden inside code block")
@@ -363,6 +400,11 @@ def _validate_model_turn(
         elif mode == "chat":
             if _RAW_JSON_LEAK_RE.search(prose_only):
                 errors.append("raw nc-agent JSON leaked into chat prose")
+        elif mode == "no_tool":
+            if "<|tool_call>" in content or "<tool_call|>" in content or "<|tool_call>" in str(thought):
+                errors.append("no_tool mode forbids <|tool_call> token leak")
+            if _RAW_JSON_LEAK_RE.search(prose_only):
+                errors.append("raw nc-agent JSON leaked into no_tool prose")
 
     return errors
 
@@ -591,7 +633,7 @@ def validate_orpo_pair(
     errors.extend(
         validate_gemma4_wire_format(
             rendered["prompt"] + rendered["chosen"],
-            allow_partial_tool_turn=bool(chosen.get("tool_calls")),
+            allow_partial_tool_turn=False,
         )
     )
 

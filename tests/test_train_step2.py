@@ -405,9 +405,9 @@ class TestExportAndStep2Notebook(unittest.TestCase):
             "timeout=14400",
             "vol.commit()",
             "haku-nekooo/gemma4-e4b-nuclear-pruned",
-            "haku-nekooo/gemma4-e4b-nuclear-agent",
+            "haku-nekooo/gemma4-e4b-nuclear-agent-v2",
             "haku-nekooo/gemma4-e2b-nuclear-pruned",
-            "haku-nekooo/gemma4-e2b-nuclear-agent",
+            "haku-nekooo/gemma4-e2b-nuclear-agent-v2",
             "IQ4_XS",
             "q8_0",
         ):
@@ -422,6 +422,8 @@ class TestExportAndStep2Notebook(unittest.TestCase):
         presets = ast.literal_eval(presets_val)
         self.assertTrue(presets["e4b"]["train_embeddings"])
         self.assertFalse(presets["e2b"]["train_embeddings"])
+        self.assertEqual(presets["e4b"]["output_subdir"], "e4b_v2")
+        self.assertEqual(presets["e2b"]["output_subdir"], "e2b_v2")
         self.assertEqual(presets["e4b"]["learning_rate"], 1.5e-4)
         self.assertEqual(presets["e2b"]["learning_rate"], 2.0e-4)
 

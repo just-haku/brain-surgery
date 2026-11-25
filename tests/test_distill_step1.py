@@ -198,8 +198,8 @@ class TestGemma4Formatter(unittest.TestCase):
         self.assertTrue(text.startswith("<bos><|turn>system\n<|think|>\nSys prompt<|tool>declaration:read_symbol{"))
         self.assertIn(
             "<|turn>model\n<|channel>thought\nRead symbol first.\n<channel|>"
-            '<|tool_call>call:read_symbol{path:<|"|>src/lib.rs<|"|>,symbol:<|"|>add<|"|>}<tool_call|>'
-            '<|tool_response>response:read_symbol{value:<|"|>fn add(a: i32) -> i32 { a }<|"|>}<tool_response|>'
+            '<|tool_call>call:read_symbol{path:<|"|>src/lib.rs<|"|>,symbol:<|"|>add<|"|>}<tool_call|><turn|>\n'
+            '<|turn>model\n<|tool_response>response:read_symbol{value:<|"|>fn add(a: i32) -> i32 { a }<|"|>}<tool_response|>'
             "<|channel>thought\nAnswer clearly.\n<channel|>Done.<turn|>\n",
             text,
         )
@@ -210,9 +210,59 @@ class TestGemma4Formatter(unittest.TestCase):
         span1 = text[spans[0][0] : spans[0][1]]
         span2 = text[spans[1][0] : spans[1][1]]
         self.assertTrue(span1.startswith("<|channel>thought\nRead symbol first."))
-        self.assertTrue(span1.endswith("<tool_call|>"))
+        self.assertTrue(span1.endswith("<tool_call|><turn|>"))
         self.assertNotIn("<|tool_response>", span1)
         self.assertEqual(span2, "<|channel>thought\nAnswer clearly.\n<channel|>Done.<turn|>")
+
+    def test_parallel_tool_calls_share_single_turn_end_in_span_and_orpo(self) -> None:
+        tools = get_nc_openai_tools(["read_symbol", "read_outline"])
+        msgs = [
+            {"role": "system", "content": "Sys prompt"},
+            {"role": "user", "content": "Inspect both files"},
+            {
+                "role": "assistant",
+                "reasoning_content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "read_outline", "arguments": {"path": "src/a.rs"}}},
+                    {"id": "c2", "type": "function", "function": {"name": "read_symbol", "arguments": {"path": "src/b.rs", "symbol": "run"}}},
+                ],
+                "content": "",
+            },
+            {"role": "tool", "tool_call_id": "c1", "name": "read_outline", "content": "fn helper()"},
+            {"role": "tool", "tool_call_id": "c2", "name": "read_symbol", "content": "fn run() {}"},
+            {"role": "assistant", "reasoning_content": None, "content": "Checked both."},
+        ]
+        out = render_gemma4_training_sample(msgs, tools=tools, enable_thinking=False)
+        text = out["text"]
+        self.assertEqual(validate_gemma4_wire_format(text), [])
+        span1 = text[out["assistant_spans"][0][0] : out["assistant_spans"][0][1]]
+        self.assertIn("call:read_outline", span1)
+        self.assertIn("call:read_symbol", span1)
+        self.assertEqual(span1.count("<turn|>"), 1)
+        self.assertTrue(span1.endswith("<tool_call|><turn|>"))
+
+        pair = render_gemma4_orpo_pair(
+            prompt_messages=[{"role": "user", "content": "Check a.rs"}],
+            chosen={
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_outline", "arguments": {"path": "src/a.rs"}}}],
+            },
+            rejected={
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "read_outline", "arguments": {"path": "src/a.rs"}}},
+                    {"id": "c2", "type": "function", "function": {"name": "read_outline", "arguments": {"path": "src/a.rs"}}},
+                ],
+            },
+            tools=tools,
+            enable_thinking=False,
+        )
+        self.assertTrue(pair["chosen"].endswith("<tool_call|><turn|>\n"))
+        self.assertEqual(validate_gemma4_wire_format(pair["prompt"] + pair["chosen"]), [])
 
     def test_orpo_post_user_and_post_tool_plus_xml_guard(self) -> None:
         pair = render_gemma4_orpo_pair(
@@ -559,6 +609,117 @@ class TestValidatorPolicy(unittest.TestCase):
             "rejected": {"role": "assistant", "content": "STATUS: DONE\nCHANGES: Checked\nFILES: src/a.rs\nISSUES: none", "reasoning_content": "Long worker CoT."},
         }
         self.assertEqual(validate_orpo_pair(per_orpo), [])
+
+    def test_wave5_no_tool_and_anti_loop_orpo_rules(self) -> None:
+        coder_no_spawn_sys = build_nc_system_prompt("coder", depth=1)
+        no_tool_think = {
+            "id": "w5_py_think",
+            "bucket": "pure_algo_python",
+            "mode": "no_tool",
+            "tools": [],
+            "thinking": True,
+            "messages": [
+                {"role": "system", "content": coder_no_spawn_sys},
+                {"role": "user", "content": "Write binary search."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Check bounds invariant.",
+                    "content": "```python\ndef bs(a, x):\n    return -1\n```",
+                },
+            ],
+        }
+        self.assertEqual(validate_sft_sample(no_tool_think), [])
+
+        no_tool_regex = {
+            **no_tool_think,
+            "id": "w5_js_regex",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": coder_no_spawn_sys},
+                {"role": "user", "content": "Parse version ops."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": None,
+                    "content": "Use regex:\n```js\nconst m = /^(>=|<=|>|<|=)?(.+)$/.exec(tok);\n```",
+                },
+            ],
+        }
+        self.assertEqual(validate_sft_sample(no_tool_regex), [])
+
+        no_tool_leak = {
+            **no_tool_think,
+            "id": "w5_bad_leak",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": coder_no_spawn_sys},
+                {"role": "user", "content": "Explain GIL."},
+                {"role": "assistant", "reasoning_content": None, "content": "<|tool_call>call:read_symbol{}<tool_call|>"},
+            ],
+        }
+        self.assertTrue(any("no_tool mode forbids <|tool_call>" in e for e in validate_sft_sample(no_tool_leak)))
+
+        anti_loop_orpo = {
+            "id": "w5_pref_loop",
+            "bucket": "anti_loop_tool_termination",
+            "prompt": [
+                {"role": "system", "content": build_nc_system_prompt("coder", depth=0)},
+                {"role": "user", "content": "## REPO_MAP\nweb/sync_queue.js: [20L]\n\n## TASK\nTrace retry backoff"},
+            ],
+            "chosen": {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "spawn_subagent", "arguments": '{"role":"CODER","task":"Trace retry","files":["web/sync_queue.js"]}'},
+                    }
+                ],
+            },
+            "rejected": {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "spawn_subagent", "arguments": '{"role":"CODER","task":"Trace retry","files":["web/sync_queue.js"]}'}},
+                    {"id": "c2", "type": "function", "function": {"name": "spawn_subagent", "arguments": '{"role":"CODER","task":"Trace retry","files":["web/sync_queue.js"]}'}},
+                ],
+            },
+        }
+        self.assertEqual(validate_orpo_pair(anti_loop_orpo), [])
+
+        clean_code_orpo = {
+            "id": "w5_pref_clean",
+            "bucket": "clean_code_vs_syntax_hallucination",
+            "tools": [],
+            "prompt": [
+                {"role": "system", "content": coder_no_spawn_sys},
+                {"role": "user", "content": "Write top_k_min in Python."},
+            ],
+            "chosen": {"role": "assistant", "content": "```python\nimport heapq\n```", "reasoning_content": None},
+            "rejected": {"role": "assistant", "content": "```python\nimport heapqueue\n```", "reasoning_content": None},
+        }
+        self.assertEqual(validate_orpo_pair(clean_code_orpo), [])
+
+        rendered_no_tool = render_gemma4_training_sample(no_tool_regex["messages"], tools=None, enable_thinking=False)
+        self.assertNotIn("<|tool>", rendered_no_tool["text"])
+
+        early_returns = {
+            **no_tool_think,
+            "id": "w5_early_returns",
+            "thinking": False,
+            "messages": [
+                {"role": "system", "content": coder_no_spawn_sys},
+                {"role": "user", "content": "Match clauses."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": None,
+                    "content": "```python\n" + "\n".join(f"if c == {i}:\n    return False" for i in range(8)) + "\n```",
+                },
+            ],
+        }
+        self.assertEqual(validate_sft_sample(early_returns), [])
 
 
 class TestPromptsBatchAndNotebook(unittest.TestCase):

@@ -373,10 +373,13 @@ def validate_tool_call(tool_name: str, args: dict[str, Any]) -> list[str]:
             else:
                 if key in spec["non_empty"] and not val.strip():
                     errors.append(f"tool {tool_name!r} arg {key!r} must be non-empty")
-                if key in enums and val not in enums[key]:
-                    errors.append(
-                        f"tool {tool_name!r} arg {key!r}={val!r} must be one of {enums[key]}"
-                    )
+                if key in enums:
+                    allowed_vals = enums[key]
+                    cmp_val = val.lower() if (tool_name == "spawn_subagent" and key == "role") else val
+                    if cmp_val not in allowed_vals:
+                        errors.append(
+                            f"tool {tool_name!r} arg {key!r}={val!r} must be one of {enums[key]}"
+                        )
         elif expected_type is list:
             if not isinstance(val, list) or any(
                 not isinstance(item, str) or not item.strip() for item in val
