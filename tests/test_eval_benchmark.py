@@ -167,6 +167,8 @@ def dijkstra(n, edges, src):
             reused.write_bytes(b"0" * 2_000_000)
             specs = build_model_specs(tdir)
             self.assertEqual(resolve_local_gguf_path(specs["e2b_inst"], "Q4_K_M"), reused)
+            self.assertEqual(specs["e4b_nc_v2"].local_dir, tdir / "agents" / "e4b_v2")
+            self.assertEqual(specs["e2b_nc_v2"].local_dir, tdir / "agents" / "e2b_v2")
 
             res_dir = tdir / "results"
             res_dir.mkdir()

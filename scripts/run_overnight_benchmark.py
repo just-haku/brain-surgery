@@ -28,7 +28,7 @@ def main() -> int:
     parser.add_argument("--brain-dir", type=Path, default=Path("brain"))
     parser.add_argument("--prep-assets", action="store_true")
     parser.add_argument("--download-baselines", action="store_true")
-    parser.add_argument("--download-agent", choices=("e2b", "e4b"), nargs="+")
+    parser.add_argument("--download-agent", choices=("e2b", "e4b", "e2b_v2", "e4b_v2"), nargs="+")
     parser.add_argument("--run", choices=tuple(MODEL_SPECS.keys()), nargs="+")
     parser.add_argument("--quants", choices=("IQ4_XS", "Q4_K_M"), nargs="+", default=["IQ4_XS", "Q4_K_M"])
     parser.add_argument("--skip-live-nc", action="store_true")
